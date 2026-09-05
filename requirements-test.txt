@@ -18,7 +18,7 @@ sqlalchemy>=2.0.0
 
 # Test Utilities
 httpx>=0.24.0
-responses>=0.23.0
+responses>=0.26.3
 faker>=19.0.0
 freezegun>=1.2.2
 
