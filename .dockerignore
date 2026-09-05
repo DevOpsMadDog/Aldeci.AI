@@ -1,0 +1,125 @@
+# ============================================
+# ALdeci Docker Build Context Exclusions
+# ============================================
+# Keep the build context small for fast builds.
+# Only include code that the container needs.
+# ============================================
+
+# Version control (saves ~200MB+)
+.git
+.gitignore
+.gitmodules
+
+# Python caches
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov/
+.tox/
+
+# Virtual environments
+.venv
+venv
+env
+
+# Node modules (each Dockerfile copies what it needs)
+**/node_modules
+.next
+**/.turbo
+# Exclude all dist except the production frontend build
+**/dist
+!suite-ui/aldeci-ui-new/dist
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+*.bak
+*.tmp
+
+# Build artifacts
+*.egg-info
+build/
+*.whl
+
+# Environment files (NEVER ship secrets)
+.env
+.env.*
+!.env.example
+
+# CI/CD agent state (not needed in containers)
+.claude/
+.github/
+
+# Logs (mounted as volumes instead)
+logs/
+*.log
+
+# Test fixtures not needed in production image
+bash-5.1/
+simulations/
+tests/
+archive/
+archive_not_needed/
+tools/
+docs/
+
+# Documentation not needed in runtime image
+*.md
+!requirements*.txt
+LICENSE
+
+# Local databases must NEVER enter the image.
+#
+# `COPY suite-*/ ./suite-*/` sweeps the whole build context, so any SQLite file
+# a developer created while running locally gets baked in. Measured 2026-08-16:
+# 53 stale *.db files / ~80 MB under suite-api/ and suite-core/, dated April-June,
+# containing 1,425 dedup clusters and 3,047 events from our OWN dogfooding runs.
+# A customer deploying that image starts with our findings in their tenant —
+# a NO-MOCKS violation at deploy time, plus 80 MB of dead weight.
+#
+# A fresh install must start empty and populate through real ingestion:
+# feeds sync on first boot, findings arrive via the ingest API.
+#
+# NOTE the `**/` prefixes. .dockerignore matches with Go's filepath.Match, where `*`
+# does NOT cross a path separator — so a bare `*.db` only excludes databases sitting at
+# the build-context root. The first attempt used bare patterns and still shipped 11
+# databases / ~80 MB (feeds.db at 49 MB, finding_correlator.db at 25 MB), because every
+# one of them lives in a subdirectory.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite
+**/*.sqlite3
+**/.fixops_data/
+**/.aldeci/
+data/
+
+# Reference policy bundles are real reference data (not tenant data) — keep them.
+!suite-api/data/policies/
+!suite-api/data/policies/**
+
+# Large artifacts not needed in containers
+artefacts/
+out/
+reports/
+*.tar
+*.gz
+*.zip
+
+# Jupyter notebooks
+**/*.ipynb
+
+# Coverage / profiling
+*.prof
+.benchmarks/

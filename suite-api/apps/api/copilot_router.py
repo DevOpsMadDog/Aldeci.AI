@@ -1,0 +1,1 @@
+../../../suite-core/api/copilot_router.py

@@ -1,0 +1,1110 @@
+"""
+FixOps Knowledge Brain — The Central Intelligence Graph.
+
+Unified knowledge graph that stores ALL security entities and their relationships.
+Every API call writes to the graph, every query reads from it.
+Built on ProvenanceGraph's proven SQLite + NetworkX pattern.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+try:
+    import networkx as nx
+except Exception:  # pragma: no cover - optional dependency
+    nx = None  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# TrustGraph event-bus wiring (auto-added by hub-wiring wave)
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover - optional dependency
+    from core.trustgraph_event_bus import get_event_bus as _get_tg_bus  # type: ignore
+except Exception:  # noqa: BLE001
+    _get_tg_bus = None  # type: ignore[assignment]
+
+
+def _emit_event(event_type: str, payload):  # type: ignore[no-untyped-def]
+    """Emit an event to the TrustGraph event bus. Never raises.
+
+    Hub-level emit so this engine module participates in second-brain coverage.
+    Downstream callers are AQUA via blast-radius (depth ≤ 2).
+    """
+    if _get_tg_bus is None:
+        return
+    try:
+        bus = _get_tg_bus()
+        if bus is None:
+            return
+        emit = getattr(bus, "emit", None) or getattr(bus, "publish", None)
+        if emit is None:
+            return
+        result = emit(event_type, payload)
+        try:
+            import asyncio as _aio
+            import inspect as _insp
+            if _insp.iscoroutine(result):
+                try:
+                    loop = _aio.get_running_loop()
+                    loop.create_task(result)
+                except RuntimeError:
+                    result.close()
+        except Exception:  # pragma: no cover
+            pass
+    except Exception:  # pragma: no cover
+        pass
+
+
+# Module-load heartbeat — fires once per process so this file is observable
+# in the TrustGraph second-brain, even if no public method is called yet.
+try:  # pragma: no cover
+    _emit_event("engine.loaded", {"module": __name__})
+except Exception:  # noqa: BLE001
+    pass
+
+except (ImportError, AttributeError):
+    nx = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Entity & Edge Type Enums
+# ---------------------------------------------------------------------------
+
+
+class EntityType(str, Enum):
+    """All entity types stored in the Knowledge Brain."""
+
+    CVE = "cve"
+    CWE = "cwe"
+    CPE = "cpe"
+    ASSET = "asset"
+    FINDING = "finding"
+    REMEDIATION = "remediation"
+    ATTACK = "attack"
+    EVIDENCE = "evidence"
+    USER = "user"
+    TEAM = "team"
+    SCAN = "scan"
+    SESSION = "session"
+    CLUSTER = "cluster"
+    BUNDLE = "bundle"
+    TASK = "task"
+    WORKFLOW = "workflow"
+    REPORT = "report"
+    INTEGRATION = "integration"
+    POLICY = "policy"
+    COMMENT = "comment"
+    COMPONENT = "component"
+    SERVICE = "service"
+    FEED = "feed"
+    THREAT_ACTOR = "threat_actor"
+    TECHNIQUE = "technique"
+    PLAYBOOK = "playbook"
+    ORGANIZATION = "organization"
+    EXPOSURE_CASE = "exposure_case"
+    CONNECTOR = "connector"
+    ALERT = "alert"
+    AGENT = "agent"
+
+
+class EdgeType(str, Enum):
+    """All relationship types in the Knowledge Brain."""
+
+    EXPLOITS = "exploits"
+    MITIGATES = "mitigates"
+    AFFECTS = "affects"
+    CHAINS_TO = "chains_to"
+    CORRELATES_WITH = "correlates_with"
+    BELONGS_TO = "belongs_to"
+    CREATED_BY = "created_by"
+    ASSIGNED_TO = "assigned_to"
+    FOUND_BY = "found_by"
+    CLUSTERED_IN = "clustered_in"
+    REMEDIATED_BY = "remediated_by"
+    EVIDENCED_BY = "evidenced_by"
+    MEMBER_OF = "member_of"
+    USED_BY = "used_by"
+    EXPOSED_ON = "exposed_on"
+    OWNED_BY = "owned_by"
+    HAS_POLICY = "has_policy"
+    HAS_EPSS = "has_epss"
+    IN_KEV = "in_kev"
+    DEPENDS_ON = "depends_on"
+    TRIGGERS = "triggers"
+    REFERENCES = "references"
+    PRODUCED_BY = "produced_by"
+    INCLUDES = "includes"
+    TARGETS = "targets"
+    DETECTED_BY = "detected_by"
+    BLOCKS = "blocks"
+    PARENT_OF = "parent_of"
+    MAPS_TO = "maps_to"
+    GROUPS = "groups"
+    RESOLVES = "resolves"
+
+
+@dataclass
+class GraphNode:
+    """A node in the Knowledge Brain."""
+
+    node_id: str
+    node_type: EntityType
+    org_id: Optional[str] = None
+    properties: Dict[str, Any] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+    def __post_init__(self):
+        now = datetime.now(timezone.utc).isoformat()
+        if not self.created_at:
+            self.created_at = now
+        if not self.updated_at:
+            self.updated_at = now
+
+
+@dataclass
+class GraphEdge:
+    """An edge in the Knowledge Brain."""
+
+    source_id: str
+    target_id: str
+    edge_type: EdgeType
+    properties: Dict[str, Any] = field(default_factory=dict)
+    confidence: float = 1.0
+    created_at: str = ""
+
+    def __post_init__(self):
+        if not self.created_at:
+            self.created_at = datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class GraphQueryResult:
+    """Result of a graph query."""
+
+    nodes: List[Dict[str, Any]]
+    edges: List[Dict[str, Any]]
+    total_nodes: int = 0
+    total_edges: int = 0
+    query_time_ms: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Brain Core Engine
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeBrain:
+    """
+    The Central Intelligence Graph for FixOps.
+
+    Every security entity (CVE, finding, asset, scan, user, etc.) is a node.
+    Every relationship (affects, mitigates, belongs_to, etc.) is an edge.
+    Persisted in SQLite for durability, NetworkX for fast traversal.
+    Thread-safe for concurrent API access.
+    """
+
+    _instance: Optional["KnowledgeBrain"] = None
+    _lock = threading.Lock()
+
+    def __init__(self, db_path: str | Path = "fixops_brain.db") -> None:
+        self.db_path = str(db_path)
+        self._conn_lock = threading.Lock()
+        self._conn = self._open_connection()
+        self._create_tables()
+        # Backfill legacy NULL-org nodes to 'system' org on every startup.
+        # The UPDATE is a no-op once the DB is clean, so this is safe to run always.
+        self._migrate_legacy_null_nodes()
+        # Checkpoint any WAL data written in a previous session that was
+        # not flushed on shutdown (e.g. server killed with SIGKILL).
+        self._checkpoint()
+        if nx is not None:
+            self._graph = nx.MultiDiGraph()
+        else:
+            self._graph = None
+        self._load_from_db()
+        # Background thread: checkpoint every 60 s so data survives unclean kills.
+        self._stop_checkpoint = threading.Event()
+        self._checkpoint_thread = threading.Thread(
+            target=self._periodic_checkpoint, daemon=True, name="brain-checkpoint"
+        )
+        self._checkpoint_thread.start()
+        logger.info(
+            "KnowledgeBrain initialized: %d nodes, %d edges (db=%s)",
+            self.node_count(),
+            self.edge_count(),
+            self.db_path,
+        )
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """Open the SQLite connection. If the DB is corrupt, wipe and recreate.
+
+        SQLite automatically replays any existing WAL file on open — do NOT
+        delete WAL/SHM files before opening; that would discard unflushed data.
+        Only delete them if the main DB file is confirmed corrupt (unrecoverable).
+        """
+        db_file = Path(self.db_path)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            # Quick integrity check — catches corruption before we trust the file.
+            result = conn.execute("PRAGMA quick_check").fetchone()
+            if result and result[0] != "ok":
+                conn.close()
+                raise sqlite3.DatabaseError(f"Integrity check failed: {result[0]}")
+            return conn
+        except sqlite3.DatabaseError as exc:
+            logger.error(
+                "KnowledgeBrain DB corrupt (%s) — backing up and recreating: %s",
+                self.db_path,
+                exc,
+            )
+            # Back up the corrupt file + its WAL/SHM, then start fresh.
+            corrupt_path = self.db_path + ".corrupt"
+            try:
+                db_file.rename(corrupt_path)
+                logger.info("Corrupt DB moved to %s", corrupt_path)
+            except OSError:
+                db_file.unlink(missing_ok=True)
+            # Remove orphaned WAL/SHM for the corrupt DB — they're useless now.
+            for suffix in ("-wal", "-shm"):
+                Path(self.db_path + suffix).unlink(missing_ok=True)
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+
+    def _checkpoint(self) -> None:
+        """Run a WAL checkpoint to flush pending writes into the main DB file."""
+        try:
+            with self._conn_lock:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+            logger.warning("WAL checkpoint failed (non-fatal): %s", exc)
+
+    def _periodic_checkpoint(self) -> None:
+        """Background loop: checkpoint every 60 seconds."""
+        while not self._stop_checkpoint.wait(timeout=60):
+            self._checkpoint()
+
+    @classmethod
+    def get_instance(cls, db_path: str | Path = "fixops_brain.db") -> "KnowledgeBrain":
+        """Get or create the singleton KnowledgeBrain instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(db_path=db_path)
+        return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset the singleton (for testing)."""
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance.close()
+                cls._instance = None
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+    # Reserved org_id for shared/global knowledge (CVEs, threat-actor nodes, etc.).
+    # Nodes with this org_id are readable by all tenants but deletable only by
+    # callers with admin:all scope.
+    SYSTEM_ORG: str = "system"
+
+    def _create_tables(self) -> None:
+        with self._conn_lock:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS brain_nodes (
+                    node_id    TEXT PRIMARY KEY,
+                    node_type  TEXT NOT NULL,
+                    org_id     TEXT,
+                    properties TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_nodes_type ON brain_nodes(node_type);
+                CREATE INDEX IF NOT EXISTS idx_nodes_org  ON brain_nodes(org_id);
+
+                CREATE TABLE IF NOT EXISTS brain_edges (
+                    source_id  TEXT NOT NULL,
+                    target_id  TEXT NOT NULL,
+                    edge_type  TEXT NOT NULL,
+                    properties TEXT NOT NULL DEFAULT '{}',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_id, target_id, edge_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_edges_source ON brain_edges(source_id);
+                CREATE INDEX IF NOT EXISTS idx_edges_target ON brain_edges(target_id);
+                CREATE INDEX IF NOT EXISTS idx_edges_type   ON brain_edges(edge_type);
+
+                CREATE TABLE IF NOT EXISTS brain_events (
+                    event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    source     TEXT NOT NULL,
+                    data       TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_type ON brain_events(event_type);
+            """
+            )
+
+    def _migrate_legacy_null_nodes(self) -> None:
+        """Idempotent one-time migration: backfill NULL/empty org_id to SYSTEM_ORG.
+
+        Legacy nodes created before tenant-isolation was enforced have org_id=NULL.
+        These represent shared knowledge (CVEs, threat-actor data, etc.) that is
+        readable by all tenants.  We assign them to the reserved 'system' org so
+        that the isolation guards in brain_router can apply consistent rules:
+        - Any tenant may read system nodes (shared threat knowledge).
+        - Only callers with admin:all scope may delete system nodes.
+
+        This UPDATE is a no-op on databases that have already been migrated.
+        """
+        with self._conn_lock:
+            cursor = self._conn.execute(
+                "UPDATE brain_nodes SET org_id = ? WHERE org_id IS NULL OR org_id = ''",
+                (self.SYSTEM_ORG,),
+            )
+            self._conn.commit()
+        if cursor.rowcount:
+            logger.info(
+                "KnowledgeBrain: migrated %d legacy NULL-org nodes to org_id='%s'",
+                cursor.rowcount,
+                self.SYSTEM_ORG,
+            )
+
+    def reload_graph(self) -> Dict[str, int]:
+        """Reload the in-memory NetworkX graph from SQLite (picks up externally inserted edges)."""
+        if self._graph is not None and nx is not None:
+            with self._conn_lock:
+                self._graph.clear()
+            self._load_from_db()
+        s = self.stats()
+        return {"nodes": s["total_nodes"], "edges": s["total_edges"]}
+
+    def _load_from_db(self) -> None:
+        """Load all nodes and edges from SQLite into NetworkX graph."""
+        if self._graph is None:
+            return
+        with self._conn_lock:
+            cursor = self._conn.execute(
+                "SELECT node_id, node_type, org_id, properties, created_at, updated_at FROM brain_nodes"
+            )
+            for row in cursor:
+                node_id, node_type, org_id, props_json, created_at, updated_at = row
+                if node_id is None:
+                    continue  # skip corrupt rows
+                props = json.loads(props_json) if props_json else {}
+                # Remove keys that are passed explicitly to avoid duplicate keyword argument errors
+                for _reserved in ("node_type", "org_id", "created_at", "updated_at"):
+                    props.pop(_reserved, None)
+                self._graph.add_node(
+                    node_id,
+                    node_type=node_type,
+                    org_id=org_id,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    **props,
+                )
+            cursor = self._conn.execute(
+                "SELECT source_id, target_id, edge_type, properties, confidence, created_at FROM brain_edges"
+            )
+            for row in cursor:
+                src, tgt, edge_type, props_json, confidence, created_at = row
+                if src is None or tgt is None:
+                    continue  # skip corrupt rows
+                props = json.loads(props_json) if props_json else {}
+                self._graph.add_edge(
+                    src,
+                    tgt,
+                    edge_type=edge_type,
+                    confidence=confidence,
+                    created_at=created_at,
+                    **props,
+                )
+
+    # ------------------------------------------------------------------
+    # Node CRUD
+    # ------------------------------------------------------------------
+    def upsert_node(self, node: GraphNode) -> GraphNode:
+        """Insert or update a node in the brain."""
+        node.updated_at = datetime.now(timezone.utc).isoformat()
+        props_json = json.dumps(node.properties, default=str, sort_keys=True)
+        with self._conn_lock:
+            self._conn.execute(
+                """INSERT INTO brain_nodes (node_id, node_type, org_id, properties, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(node_id) DO UPDATE SET
+                       node_type=excluded.node_type,
+                       org_id=excluded.org_id,
+                       properties=excluded.properties,
+                       updated_at=excluded.updated_at""",
+                (
+                    node.node_id,
+                    node.node_type.value
+                    if isinstance(node.node_type, EntityType)
+                    else node.node_type,
+                    node.org_id,
+                    props_json,
+                    node.created_at,
+                    node.updated_at,
+                ),
+            )
+            self._conn.commit()
+        if self._graph is not None:
+            _node_props = dict(node.properties)
+            for _reserved in ("node_type", "org_id", "created_at", "updated_at"):
+                _node_props.pop(_reserved, None)
+            self._graph.add_node(
+                node.node_id,
+                node_type=node.node_type.value
+                if isinstance(node.node_type, EntityType)
+                else node.node_type,
+                org_id=node.org_id,
+                created_at=node.created_at,
+                updated_at=node.updated_at,
+                **_node_props,
+            )
+        return node
+
+    def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Get a node by ID."""
+        with self._conn_lock:
+            row = self._conn.execute(
+                "SELECT node_id, node_type, org_id, properties, created_at, updated_at FROM brain_nodes WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "node_id": row[0],
+            "node_type": row[1],
+            "org_id": row[2],
+            "properties": json.loads(row[3]),
+            "created_at": row[4],
+            "updated_at": row[5],
+        }
+
+    def delete_node(self, node_id: str) -> bool:
+        """Delete a node and all its edges."""
+        with self._conn_lock:
+            self._conn.execute(
+                "DELETE FROM brain_edges WHERE source_id = ? OR target_id = ?",
+                (node_id, node_id),
+            )
+            cursor = self._conn.execute(
+                "DELETE FROM brain_nodes WHERE node_id = ?", (node_id,)
+            )
+            self._conn.commit()
+        if self._graph is not None and self._graph.has_node(node_id):
+            self._graph.remove_node(node_id)
+        return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Edge CRUD
+    # ------------------------------------------------------------------
+    def add_edge(self, edge: GraphEdge) -> GraphEdge:
+        """Add or update an edge."""
+        props_json = json.dumps(edge.properties, default=str, sort_keys=True)
+        edge_type_val = (
+            edge.edge_type.value
+            if isinstance(edge.edge_type, EdgeType)
+            else edge.edge_type
+        )
+        with self._conn_lock:
+            self._conn.execute(
+                """INSERT INTO brain_edges (source_id, target_id, edge_type, properties, confidence, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
+                       properties=excluded.properties,
+                       confidence=excluded.confidence""",
+                (
+                    edge.source_id,
+                    edge.target_id,
+                    edge_type_val,
+                    props_json,
+                    edge.confidence,
+                    edge.created_at,
+                ),
+            )
+            self._conn.commit()
+        if self._graph is not None:
+            self._graph.add_edge(
+                edge.source_id,
+                edge.target_id,
+                edge_type=edge_type_val,
+                confidence=edge.confidence,
+                created_at=edge.created_at,
+                **edge.properties,
+            )
+        return edge
+
+    def get_edges(self, node_id: str, direction: str = "both") -> List[Dict[str, Any]]:
+        """Get all edges connected to a node."""
+        results = []
+        with self._conn_lock:
+            if direction in ("out", "both"):
+                cursor = self._conn.execute(
+                    "SELECT source_id, target_id, edge_type, properties, confidence, created_at FROM brain_edges WHERE source_id = ?",
+                    (node_id,),
+                )
+                for row in cursor:
+                    results.append(
+                        {
+                            "source_id": row[0],
+                            "target_id": row[1],
+                            "edge_type": row[2],
+                            "properties": json.loads(row[3]),
+                            "confidence": row[4],
+                            "created_at": row[5],
+                        }
+                    )
+            if direction in ("in", "both"):
+                cursor = self._conn.execute(
+                    "SELECT source_id, target_id, edge_type, properties, confidence, created_at FROM brain_edges WHERE target_id = ?",
+                    (node_id,),
+                )
+                for row in cursor:
+                    results.append(
+                        {
+                            "source_id": row[0],
+                            "target_id": row[1],
+                            "edge_type": row[2],
+                            "properties": json.loads(row[3]),
+                            "confidence": row[4],
+                            "created_at": row[5],
+                        }
+                    )
+        return results
+
+    def delete_edge(self, source_id: str, target_id: str, edge_type: str) -> bool:
+        """Delete a specific edge."""
+        with self._conn_lock:
+            cursor = self._conn.execute(
+                "DELETE FROM brain_edges WHERE source_id = ? AND target_id = ? AND edge_type = ?",
+                (source_id, target_id, edge_type),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+    def query_nodes(
+        self,
+        node_type: Optional[str] = None,
+        org_id: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> GraphQueryResult:
+        """Query nodes with optional filters."""
+        start = time.monotonic()
+        conditions = []
+        params: list = []
+        if node_type:
+            conditions.append("node_type = ?")
+            params.append(node_type)
+        if org_id:
+            conditions.append("org_id = ?")
+            params.append(org_id)
+        if search:
+            conditions.append("(node_id LIKE ? OR properties LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        with self._conn_lock:
+            count_row = self._conn.execute(
+                f"SELECT COUNT(*) FROM brain_nodes {where}", params  # nosec B608 — WHERE from hardcoded columns with ? params
+            ).fetchone()
+            total = count_row[0] if count_row else 0
+
+            params_page = params + [limit, offset]
+            cursor = self._conn.execute(
+                f"SELECT node_id, node_type, org_id, properties, created_at, updated_at FROM brain_nodes {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",  # nosec B608
+                params_page,
+            )
+            nodes = []
+            for row in cursor:
+                nodes.append(
+                    {
+                        "node_id": row[0],
+                        "node_type": row[1],
+                        "org_id": row[2],
+                        "properties": json.loads(row[3]),
+                        "created_at": row[4],
+                        "updated_at": row[5],
+                    }
+                )
+
+        elapsed = (time.monotonic() - start) * 1000
+        return GraphQueryResult(
+            nodes=nodes, edges=[], total_nodes=total, query_time_ms=elapsed
+        )
+
+    def get_neighbors(
+        self, node_id: str, depth: int = 1, edge_types: Optional[List[str]] = None
+    ) -> GraphQueryResult:
+        """Get neighbors of a node up to N hops deep."""
+        start = time.monotonic()
+        visited_nodes: Set[str] = {node_id}
+        frontier: Set[str] = {node_id}
+        all_edges: List[Dict[str, Any]] = []
+
+        for _ in range(depth):
+            next_frontier: Set[str] = set()
+            for nid in frontier:
+                edges = self.get_edges(nid)
+                for e in edges:
+                    if edge_types and e["edge_type"] not in edge_types:
+                        continue
+                    all_edges.append(e)
+                    other = e["target_id"] if e["source_id"] == nid else e["source_id"]
+                    if other not in visited_nodes:
+                        visited_nodes.add(other)
+                        next_frontier.add(other)
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        nodes = [self.get_node(nid) for nid in visited_nodes]
+        nodes = [n for n in nodes if n is not None]
+        elapsed = (time.monotonic() - start) * 1000
+        return GraphQueryResult(
+            nodes=nodes,
+            edges=all_edges,
+            total_nodes=len(nodes),
+            total_edges=len(all_edges),
+            query_time_ms=elapsed,
+        )
+
+    def find_paths(
+        self, source_id: str, target_id: str, max_depth: int = 5
+    ) -> List[List[str]]:
+        """Find all paths between two nodes (up to max_depth)."""
+        if self._graph is not None and nx is not None:
+            try:
+                paths = list(
+                    nx.all_simple_paths(
+                        self._graph, source_id, target_id, cutoff=max_depth
+                    )
+                )
+                return [list(p) for p in paths[:20]]  # Cap at 20 paths
+            except (nx.NodeNotFound, nx.NetworkXError):
+                return []
+        # Fallback: BFS
+        return self._bfs_paths(source_id, target_id, max_depth)
+
+    def _bfs_paths(self, source: str, target: str, max_depth: int) -> List[List[str]]:
+        """BFS path finding without NetworkX."""
+        from collections import deque
+
+        paths: List[List[str]] = []
+        queue: deque = deque([(source, [source])])
+        while queue and len(paths) < 20:
+            node, path = queue.popleft()
+            if len(path) > max_depth + 1:
+                continue
+            if node == target and len(path) > 1:
+                paths.append(path)
+                continue
+            edges = self.get_edges(node, direction="out")
+            for e in edges:
+                next_node = e["target_id"]
+                if next_node not in path:
+                    queue.append((next_node, path + [next_node]))
+        return paths
+
+    # ------------------------------------------------------------------
+    # Analytics
+    # ------------------------------------------------------------------
+    def stats(self) -> Dict[str, Any]:
+        """Get comprehensive graph statistics."""
+        with self._conn_lock:
+            node_count = self._conn.execute(
+                "SELECT COUNT(*) FROM brain_nodes"
+            ).fetchone()[0]
+            edge_count = self._conn.execute(
+                "SELECT COUNT(*) FROM brain_edges"
+            ).fetchone()[0]
+            type_counts = {}
+            for row in self._conn.execute(
+                "SELECT node_type, COUNT(*) FROM brain_nodes GROUP BY node_type"
+            ):
+                type_counts[row[0]] = row[1]
+            edge_type_counts = {}
+            for row in self._conn.execute(
+                "SELECT edge_type, COUNT(*) FROM brain_edges GROUP BY edge_type"
+            ):
+                edge_type_counts[row[0]] = row[1]
+            org_counts = {}
+            for row in self._conn.execute(
+                "SELECT org_id, COUNT(*) FROM brain_nodes WHERE org_id IS NOT NULL GROUP BY org_id"
+            ):
+                org_counts[row[0]] = row[1]
+
+        # Compute density from SQL counts (always accurate, never stale from in-memory graph)
+        density = 0.0
+        if node_count > 1:
+            max_directed_edges = node_count * (node_count - 1)
+            density = edge_count / max_directed_edges if max_directed_edges > 0 else 0.0
+
+        return {
+            "total_nodes": node_count,
+            "total_edges": edge_count,
+            "density": density,
+            "node_types": type_counts,
+            "edge_types": edge_type_counts,
+            "organizations": org_counts,
+        }
+
+    def node_count(self) -> int:
+        with self._conn_lock:
+            return self._conn.execute("SELECT COUNT(*) FROM brain_nodes").fetchone()[0]
+
+    def edge_count(self) -> int:
+        with self._conn_lock:
+            return self._conn.execute("SELECT COUNT(*) FROM brain_edges").fetchone()[0]
+
+    def most_connected(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get most connected nodes (highest degree)."""
+        if self._graph is not None and nx is not None:
+            try:
+                degrees = sorted(
+                    self._graph.degree(), key=lambda x: x[1], reverse=True
+                )[:limit]
+                results = []
+                for node_id, degree in degrees:
+                    node = self.get_node(node_id)
+                    if node:
+                        node["degree"] = degree
+                        results.append(node)
+                return results
+            except (OSError, ValueError, RuntimeError):  # narrowed from bare Exception
+                pass
+        # Fallback
+        with self._conn_lock:
+            cursor = self._conn.execute(
+                """
+                SELECT node_id, cnt FROM (
+                    SELECT source_id AS node_id, COUNT(*) AS cnt FROM brain_edges GROUP BY source_id
+                    UNION ALL
+                    SELECT target_id AS node_id, COUNT(*) AS cnt FROM brain_edges GROUP BY target_id
+                ) GROUP BY node_id ORDER BY SUM(cnt) DESC LIMIT ?
+            """,
+                (limit,),
+            )
+            results = []
+            for row in cursor:
+                node = self.get_node(row[0])
+                if node:
+                    node["degree"] = row[1]
+                    results.append(node)
+            return results
+
+    def pagerank(
+        self,
+        limit: int = 20,
+        alpha: float = 0.85,
+        max_iter: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return top-N nodes ranked by PageRank influence score.
+
+        Uses NetworkX ``pagerank`` on the in-memory MultiDiGraph when available;
+        falls back to a degree-count approximation via SQLite when NetworkX is
+        absent or the graph is empty.
+
+        Args:
+            limit: Number of top nodes to return (default 20, max 100).
+            alpha: Damping factor (default 0.85, standard PageRank value).
+            max_iter: Maximum power-iteration steps (default 100).
+
+        Returns:
+            List of node dicts with an extra ``pagerank_score`` key, sorted
+            descending by score.
+        """
+        limit = min(max(1, limit), 100)
+
+        if self._graph is not None and nx is not None and self._graph.number_of_nodes() > 0:
+            try:
+                scores: Dict[str, float] = nx.pagerank(
+                    self._graph, alpha=alpha, max_iter=max_iter
+                )
+                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+                results = []
+                for node_id, score in top:
+                    node = self.get_node(node_id)
+                    if node:
+                        node["pagerank_score"] = round(score, 8)
+                        results.append(node)
+                return results
+            except Exception:  # noqa: BLE001 — fall through to SQL approximation
+                pass
+
+        # SQL-based degree approximation when NetworkX unavailable / graph empty
+        with self._conn_lock:
+            cursor = self._conn.execute(
+                """
+                SELECT node_id, SUM(cnt) AS degree FROM (
+                    SELECT source_id AS node_id, COUNT(*) AS cnt
+                      FROM brain_edges GROUP BY source_id
+                    UNION ALL
+                    SELECT target_id AS node_id, COUNT(*) AS cnt
+                      FROM brain_edges GROUP BY target_id
+                ) GROUP BY node_id ORDER BY degree DESC LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+        total_degree = sum(r[1] for r in rows) or 1
+        results = []
+        for row in rows:
+            node = self.get_node(row[0])
+            if node:
+                node["pagerank_score"] = round(row[1] / total_degree, 8)
+                results.append(node)
+        return results
+
+    def risk_score_for_node(self, node_id: str) -> float:
+        """Calculate composite risk score based on graph context."""
+        node = self.get_node(node_id)
+        if not node:
+            return 0.0
+        base_risk = {
+            "cve": 0.8,
+            "finding": 0.7,
+            "attack": 0.9,
+            "threat_actor": 0.95,
+            "technique": 0.85,
+            "vulnerability": 0.8,
+            "component": 0.3,
+            "asset": 0.4,
+            "service": 0.5,
+        }.get(node["node_type"], 0.2)
+        # Severity amplifier
+        severity = node["properties"].get("severity", "").upper()
+        sev_mult = {"CRITICAL": 1.5, "HIGH": 1.3, "MEDIUM": 1.0, "LOW": 0.6}.get(
+            severity, 1.0
+        )
+        # Connectivity amplifier: more connections = more risk
+        edges = self.get_edges(node_id)
+        conn_mult = min(1.0 + len(edges) * 0.05, 2.0)
+        return min(base_risk * sev_mult * conn_mult, 1.0)
+
+    # ------------------------------------------------------------------
+    # Convenience Ingest Methods
+    # ------------------------------------------------------------------
+    def ingest_cve(
+        self, cve_id: str, org_id: Optional[str] = None, **props
+    ) -> GraphNode:
+        """Ingest a CVE into the brain."""
+        node = GraphNode(
+            node_id=f"cve:{cve_id}",
+            node_type=EntityType.CVE,
+            org_id=org_id,
+            properties={"cve_id": cve_id, **props},
+        )
+        return self.upsert_node(node)
+
+    def ingest_finding(
+        self,
+        finding_id: str,
+        org_id: Optional[str] = None,
+        cve_id: Optional[str] = None,
+        **props,
+    ) -> GraphNode:
+        """Ingest a security finding."""
+        node = GraphNode(
+            node_id=f"finding:{finding_id}",
+            node_type=EntityType.FINDING,
+            org_id=org_id,
+            properties={"finding_id": finding_id, **props},
+        )
+        self.upsert_node(node)
+        if cve_id:
+            self.add_edge(
+                GraphEdge(
+                    source_id=f"finding:{finding_id}",
+                    target_id=f"cve:{cve_id}",
+                    edge_type=EdgeType.REFERENCES,
+                )
+            )
+        return node
+
+    def ingest_scan(
+        self,
+        scan_id: str,
+        org_id: Optional[str] = None,
+        findings: Optional[List[str]] = None,
+        **props,
+    ) -> GraphNode:
+        """Ingest a scan result."""
+        node = GraphNode(
+            node_id=f"scan:{scan_id}",
+            node_type=EntityType.SCAN,
+            org_id=org_id,
+            properties={"scan_id": scan_id, **props},
+        )
+        self.upsert_node(node)
+        for fid in findings or []:
+            self.add_edge(
+                GraphEdge(
+                    source_id=f"scan:{scan_id}",
+                    target_id=f"finding:{fid}",
+                    edge_type=EdgeType.DETECTED_BY,
+                )
+            )
+        return node
+
+    def ingest_asset(
+        self, asset_id: str, org_id: Optional[str] = None, **props
+    ) -> GraphNode:
+        """Ingest an asset."""
+        return self.upsert_node(
+            GraphNode(
+                node_id=f"asset:{asset_id}",
+                node_type=EntityType.ASSET,
+                org_id=org_id,
+                properties={"asset_id": asset_id, **props},
+            )
+        )
+
+    def ingest_remediation(
+        self,
+        task_id: str,
+        finding_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+        **props,
+    ) -> GraphNode:
+        """Ingest a remediation task."""
+        node = GraphNode(
+            node_id=f"remediation:{task_id}",
+            node_type=EntityType.REMEDIATION,
+            org_id=org_id,
+            properties={"task_id": task_id, **props},
+        )
+        self.upsert_node(node)
+        if finding_id:
+            self.add_edge(
+                GraphEdge(
+                    source_id=f"remediation:{task_id}",
+                    target_id=f"finding:{finding_id}",
+                    edge_type=EdgeType.MITIGATES,
+                )
+            )
+        return node
+
+    def log_event(self, event_type: str, source: str, data: Dict[str, Any]) -> None:
+        """Log an event to the brain's event log."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn_lock:
+            self._conn.execute(
+                "INSERT INTO brain_events (event_type, source, data, created_at) VALUES (?, ?, ?, ?)",
+                (event_type, source, json.dumps(data, default=str), now),
+            )
+            self._conn.commit()
+
+    def get_events(
+        self, event_type: Optional[str] = None, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get recent events from the brain."""
+        with self._conn_lock:
+            if event_type:
+                cursor = self._conn.execute(
+                    "SELECT event_id, event_type, source, data, created_at FROM brain_events WHERE event_type = ? ORDER BY event_id DESC LIMIT ?",
+                    (event_type, limit),
+                )
+            else:
+                cursor = self._conn.execute(
+                    "SELECT event_id, event_type, source, data, created_at FROM brain_events ORDER BY event_id DESC LIMIT ?",
+                    (limit,),
+                )
+            return [
+                {
+                    "event_id": r[0],
+                    "event_type": r[1],
+                    "source": r[2],
+                    "data": json.loads(r[3]),
+                    "created_at": r[4],
+                }
+                for r in cursor
+            ]
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """Checkpoint WAL, then close database connection."""
+        # Stop background checkpoint thread first.
+        if hasattr(self, "_stop_checkpoint"):
+            self._stop_checkpoint.set()
+        # Final checkpoint: flush all WAL data into the main DB file so the
+        # next process startup reads a complete, up-to-date database.
+        self._checkpoint()
+        with self._conn_lock:
+            self._conn.close()
+        logger.info("KnowledgeBrain closed (WAL checkpointed)")
+
+    def __del__(self) -> None:
+        try:
+            if hasattr(self, "_stop_checkpoint"):
+                self._stop_checkpoint.set()
+            if hasattr(self, "_conn"):
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:  # noqa: BLE001 — best-effort in __del__
+                    pass
+                self._conn.close()
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton accessor
+# ---------------------------------------------------------------------------
+def get_brain(db_path: str | Path | None = None) -> KnowledgeBrain:
+    """Get the global KnowledgeBrain instance.
+
+    Uses ``FIXOPS_BRAIN_DB_PATH`` env-var so that **all** suites
+    (api, core, attack, feeds, evidence-risk, integrations) share
+    a single SQLite file regardless of which process imports this.
+    """
+    import os
+
+    if db_path is None:
+        db_path = os.environ.get("FIXOPS_BRAIN_DB_PATH")
+    if db_path is None:
+        # Fall back to FIXOPS_DATA_DIR before the hard-coded path.
+        #
+        # 80 call sites honour FIXOPS_DATA_DIR; this one did not, so an operator
+        # who set it to isolate a deployment still got the shared
+        # ./data/fixops_brain.db. Two processes then wrote one SQLite file and
+        # corrupted it — twice, in one afternoon, both times presenting as an
+        # opaque 500 "database" with a correlation id and no cause.
+        #
+        # FIXOPS_BRAIN_DB_PATH still wins when set, so an existing deployment
+        # that pins the file explicitly is unaffected.
+        data_dir = os.environ.get("FIXOPS_DATA_DIR")
+        db_path = f"{data_dir}/fixops_brain.db" if data_dir else "data/fixops_brain.db"
+    resolved = Path(db_path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return KnowledgeBrain.get_instance(db_path=resolved)

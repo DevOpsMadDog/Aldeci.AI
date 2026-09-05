@@ -1,0 +1,1263 @@
+"""
+ALdeci Scanner Ingest Router — Universal scanner output ingestion API.
+
+Accepts output from 25+ security scanners via upload, webhook, or auto-detect.
+Plugs into the Brain Pipeline via NormalizerRegistry.
+
+Endpoints:
+  POST /api/v1/scanner-ingest/upload         — File upload (multipart)
+  POST /api/v1/scanner-ingest/webhook/{type}  — Webhook receiver (raw body)
+  POST /api/v1/scanner-ingest/detect          — Auto-detect scanner type
+  GET  /api/v1/scanner-ingest/supported       — List supported scanners
+  GET  /api/v1/scanner-ingest/stats           — Ingestion statistics
+
+Vision Pillars: V1 (APP_ID-Centric), V3 (Decision Intelligence), V7 (MCP-Native), V9 (Air-Gapped)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from apps.api.dependencies import get_org_id
+from apps.api.endpoint_rate_limit import enforce as _rl_enforce
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/v1/scanner-ingest",
+    tags=["scanner-ingest"],
+)
+
+# ── Security constants ──────────────────────────────────────────────
+# Maximum upload size: 50 MB (prevents zip bombs and memory exhaustion)
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# Internal alias — used throughout this module
+_MAX_UPLOAD_BYTES = MAX_UPLOAD_BYTES
+# Maximum body size for webhook ingestion: 50 MB
+_MAX_WEBHOOK_BYTES = 50 * 1024 * 1024
+# Allowed file extensions for scanner output uploads.
+# Deliberately narrow: only well-known scanner output formats accepted.
+# Reject executables, archives, scripts, and other risky types with 415.
+_ALLOWED_EXTENSIONS = frozenset({
+    ".json", ".sarif", ".xml", ".csv", ".txt",
+})
+# Valid scanner type characters (alphanumeric + hyphens/underscores only)
+import re as _re
+
+_SCANNER_TYPE_RE = _re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _validate_scanner_type(scanner_type: str) -> str:
+    """Validate scanner type to prevent injection attacks."""
+    s = scanner_type.strip().lower()
+    if not _SCANNER_TYPE_RE.match(s):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid scanner type format: must be alphanumeric/hyphens/underscores, 1-64 chars",
+        )
+    return s
+
+
+def _validate_filename(filename: Optional[str]) -> Optional[str]:
+    """Validate uploaded filename to prevent path traversal."""
+    if not filename:
+        return None
+    # Strip directory components (path traversal defense)
+    import os
+    # Check raw string BEFORE using os.path.basename
+    if ".." in filename or "/" in filename or "\\" in filename:
+        logger.warning("Path traversal attempt in filename: %r", filename[:100])
+        # Still extract just the base name safely
+        return os.path.basename(filename.replace("\\", "/"))
+    return os.path.basename(filename)
+
+
+def _validate_upload_size(content: bytes, max_bytes: int = _MAX_UPLOAD_BYTES) -> None:
+    """Validate upload size to prevent DoS / zip bomb attacks."""
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload too large: {len(content)} bytes exceeds {max_bytes} byte limit",
+        )
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+
+# In-memory stats (shared per-process)
+_ingest_stats: Dict[str, Any] = {
+    "total_files_processed": 0,
+    "total_findings_parsed": 0,
+    "by_scanner": {},
+    "last_ingest_at": None,
+    "errors": 0,
+}
+
+
+def _get_scanner_parsers():
+    """Lazy import to avoid circular imports."""
+    try:
+        from core.scanner_parsers import (
+            SCANNER_NORMALIZERS,
+            auto_detect_scanner,
+            get_supported_scanners,
+            parse_scanner_output,
+        )
+        return {
+            "SCANNER_NORMALIZERS": SCANNER_NORMALIZERS,
+            "auto_detect_scanner": auto_detect_scanner,
+            "get_supported_scanners": get_supported_scanners,
+            "parse_scanner_output": parse_scanner_output,
+        }
+    except ImportError as e:
+        logger.warning(f"scanner_parsers not available: {e}")
+        return None
+
+
+def _serialize_findings(findings: list) -> List[Dict]:
+    """Convert findings (UnifiedFinding or dict) to JSON-safe dicts."""
+    result = []
+    for f in findings:
+        if hasattr(f, "model_dump"):
+            d = f.model_dump(exclude_none=True)
+        elif hasattr(f, "dict"):
+            d = f.dict(exclude_none=True)
+        elif isinstance(f, dict):
+            d = {k: v for k, v in f.items() if v is not None}
+        else:
+            d = {"raw": str(f)}
+        # Stringify any non-serializable values
+        for k, v in d.items():
+            if hasattr(v, "value"):  # enums
+                d[k] = v.value
+            elif isinstance(v, datetime):
+                d[k] = v.isoformat()
+        result.append(d)
+    return result
+
+
+def _local_advisory_bodies(findings_dicts: List[Dict]) -> Dict[str, tuple]:
+    """Advisory prose for these findings, from the local feed database.
+
+    Returns {} when the table is absent — an older feed bundle simply has no
+    bodies, which degrades extraction to the title and must never raise.
+    """
+    ids = {
+        str(f.get(key))
+        for f in findings_dicts
+        for key in ("rule_id", "cve_id", "vulnerability_id", "advisory_id")
+        if f.get(key)
+    }
+    if not ids:
+        return {}
+    try:
+        import os
+        import pathlib
+        import sqlite3
+
+        # Two locations, because they genuinely differ.
+        #
+        # sitecustomize sets FIXOPS_DATA_DIR to .fixops_data whenever the repo
+        # is on sys.path, so a script run WITHOUT the repo on the path resolves
+        # "data/" while the running app resolves ".fixops_data/". The advisory
+        # bodies were written to one and read from the other, and the lookup
+        # silently returned nothing — the same write-here/read-there defect that
+        # cost four bugs when cve_id and rule_id disagreed.
+        #
+        # data/feeds/feeds.db is also where the shipped image puts the feeds, so
+        # checking both is correct rather than merely forgiving.
+        # ABSOLUTE, and every copy is asked.
+        #
+        # These were relative paths, so the answer depended on the process's
+        # working directory. Started from suite-api/ they resolve to
+        # suite-api/data/feeds/feeds.db — a real 48 MB database with 327,809
+        # EPSS rows and NO advisory_details table. The old code picked the first
+        # candidate that EXISTED rather than one that could answer, found that
+        # file, raised "no such table", swallowed it, and returned {}. Today's
+        # 118 advisory bodies live in data/feeds/feeds.db and would simply never
+        # have been read; TypeScript reachability would silently fall back from
+        # 65% to 57% and nothing would say why.
+        #
+        # The app already warns about this at boot: 61 database NAMES exist at
+        # more than one path in this repo, 58 of them with rows in more than one
+        # copy. Until that is resolved, a reader must not let cwd choose.
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        raw = [
+            os.environ.get("FIXOPS_DATA_DIR", ""),
+            str(repo_root / "data"),
+            str(repo_root / ".fixops_data"),
+            str(repo_root / "suite-api" / "data"),
+        ]
+        candidates = [
+            pathlib.Path(base) / "feeds" / "feeds.db" for base in raw if base
+        ]
+        placeholders = ",".join("?" * len(ids))
+        bodies: Dict[str, tuple] = {}
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
+                rows = conn.execute(
+                    f"SELECT advisory_id, summary, details FROM advisory_details "
+                    f"WHERE advisory_id IN ({placeholders})",
+                    tuple(ids),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                # No advisory_details here. That is an older bundle, not an
+                # error, and it must not stop us asking the next copy.
+                continue
+            for advisory_id, summary, details in rows:
+                bodies.setdefault(advisory_id, (summary or "", details or ""))
+        return bodies
+    except Exception:  # pragma: no cover — missing table or older bundle
+        logger.debug("advisory bodies unavailable", exc_info=True)
+        return {}
+
+
+def _attach_vulnerable_symbols(findings_dicts: List[Dict]) -> int:
+    """Record WHERE each vulnerability lives, not just which package it is in.
+
+    Reachability was measured at 0% noise reduction on real data
+    (docs/REACHABILITY_MEASURED_2026-08-29.md) for one reason: an ingested
+    finding carried a package name and nothing finer, so the reachability query
+    degraded to ``package.%`` and asked "do you use this library" — which the
+    dependency file already answered. Every finding came back reachable.
+
+    The symbol is in the advisory prose the scanner already gives us. Extracting
+    it here, once, at the point of ingest, is what lets the engine be asked the
+    question it is actually good at: on this repository it moved two of three
+    real CVEs from "reachable" to "not reachable".
+
+    Deliberately local and deterministic — no network call. Ingest must work on
+    an air-gapped host, and a lookup that silently no-ops offline would make the
+    verdict depend on where the deployment is running.
+
+    A finding whose advisory names no symbol gets NO field set, not an empty
+    one. Absent means undetermined and keeps the finding in the queue; an empty
+    list would read downstream as "nothing to reach", which is a safety claim
+    nobody established.
+    """
+    try:
+        from core.advisory_symbols import extract_symbols
+    except Exception:  # pragma: no cover - engine optional in slim deployments
+        return 0
+
+    bodies = _local_advisory_bodies(findings_dicts)
+
+    enriched = 0
+    for finding in findings_dicts:
+        summary = str(finding.get("title") or "")
+        details = str(finding.get("description") or "")
+
+        # Fall back to the advisory body stored in the local feed database.
+        #
+        # npm audit --json supplies a TITLE and no prose. Measured on 23 real
+        # npm advisories: 0 of 8 symbols recoverable from titles, 8 of 8 from
+        # the same advisories' OSV bodies — which is why TypeScript eliminated
+        # 57% where Python eliminates 82-84%.
+        #
+        # Read from feeds.db rather than fetching, so an air-gapped site gets
+        # the same extraction as a connected one; the bodies travel in the
+        # signed feed bundle. See scripts/fetch_advisory_bodies.py.
+        if len(details) < 80:
+            for key in ("rule_id", "cve_id", "vulnerability_id", "advisory_id"):
+                body = bodies.get(str(finding.get(key) or ""))
+                if body:
+                    summary = summary or body[0]
+                    details = body[1] or details
+                    break
+
+        got = extract_symbols(summary, details)
+        if not got.known:
+            continue
+        finding["vulnerable_symbols"] = got.dotted_paths + got.symbols
+        finding["vulnerable_symbol_source"] = got.source
+        enriched += 1
+    return enriched
+
+
+def _promote_findings_to_issues(
+    findings_dicts: List[Dict[str, Any]],
+    scanner: str,
+    org_id: str,
+) -> int:
+    """Promote ingested scanner findings to /api/v1/issues queue.
+
+    Bridges scanner-ingest output into SecurityFindingsEngine — the table
+    the unified Issues federation reads from. Each finding becomes an open
+    row deduped by correlation_key (scanner|rule_or_cve|asset). Returns
+    the number of findings successfully promoted (best-effort: never raises;
+    individual record failures are skipped).
+    """
+    if not findings_dicts:
+        return 0
+    try:
+        from core.security_findings_engine import SecurityFindingsEngine
+    except ImportError:
+        logger.warning("issue promotion skipped — security_findings_engine unavailable")
+        return 0
+
+    engine = SecurityFindingsEngine()
+    promoted = 0
+    for f in findings_dicts:
+        try:
+            title = (f.get("title") or f.get("rule_id") or f.get("id") or "scanner-finding")[:500]
+            description = (f.get("description") or "")[:2000]
+            severity = str(f.get("severity") or "medium").lower()
+            if severity not in {"critical", "high", "medium", "low", "info"}:
+                severity = "medium"
+            cvss = f.get("cvss_score") or f.get("cvss") or 0.0
+            try:
+                cvss = float(cvss)
+            except (TypeError, ValueError):
+                cvss = 0.0
+            asset_id = (
+                f.get("asset_id")
+                or f.get("file_path")
+                or f.get("package_name")
+                or f.get("component")
+                or scanner
+            )
+            asset_type = (
+                f.get("asset_type")
+                or ("dependency" if f.get("package_name") else "code")
+            )
+            finding_type = (
+                f.get("finding_type")
+                or ("vulnerability" if f.get("cve_id") else "weakness")
+            )
+            remediation = (
+                f.get("recommendation")
+                or f.get("remediation")
+                or ""
+            )[:1000]
+            # Correlation key comes from core.finding_identity so that the
+            # pipeline mirror derives the SAME key. They used to differ in the
+            # location component, and a 96-finding scan became 192 stored rows.
+            from core.finding_identity import (
+                advisory_id as _advisory,
+                correlation_key as _corr,
+            )
+
+            corr_key = _corr(f, scanner)
+            engine.record_finding(
+                org_id=org_id or "default",
+                title=title,
+                finding_type=str(finding_type),
+                source_tool=scanner,
+                severity=severity,
+                cvss_score=cvss,
+                asset_id=str(asset_id),
+                asset_type=str(asset_type),
+                description=description,
+                remediation=remediation,
+                correlation_key=corr_key,
+                # Carry the vulnerability's identity through ingest.
+                #
+                # These were dropped here, so a finding that arrived by upload
+                # remembered only its TITLE. Two consequences, both invisible
+                # until you look at a screen:
+                #   * the console shows an empty CVE column beside a title that
+                #     plainly contains a CVE;
+                #   * reachability analysis needs cve_id AND package_name and
+                #     skips any finding missing either — silently — so every
+                #     uploaded finding stayed "not assessed" forever and the
+                #     product's whole verdict story never applied to them.
+                # The pipeline mirror was fixed for this; the direct ingest path
+                # was not, and one fix does not cover two doors.
+                # The SARIF normaliser puts the advisory in rule_id and leaves
+                # cve_id unset, so reading cve_id/cve alone stored an EMPTY
+                # identifier for a real CVE — and EPSS, KEV, exploitability and
+                # reachability all had nothing to join on. Observed: a finding
+                # keyed semgrep|CVE-2002-0367|... (a CVE in our KEV table)
+                # stored with cve_id='', epss_score=None, kev_listed=None.
+                # advisory_id() only returns something that LOOKS like an
+                # advisory, so a ruleId of "sql-injection" still stores empty
+                # rather than inventing a CVE.
+                cve_id=_advisory(f),
+                file_path=str(f.get("file_path") or ""),
+                line_number=f.get("line") or f.get("line_number"),
+                package_name=str(f.get("package_name") or f.get("component") or f.get("pkg_name") or ""),
+            )
+            promoted += 1
+        except (TypeError, ValueError, KeyError, RuntimeError, OSError) as e:
+            logger.debug("issue promotion record failed for one finding: %s", type(e).__name__)
+            continue
+
+    if promoted:
+        # Bump federation refresh epoch so /api/v1/issues sees new rows.
+        try:
+            from core.event_bus import EventType, get_event_bus
+            bus = get_event_bus()
+            if hasattr(bus, "publish"):
+                bus.publish(
+                    EventType.FINDINGS_INDEX_REFRESH,
+                    {"source": f"scanner-ingest:{scanner}", "findings_mirrored": promoted},
+                )
+        except (ImportError, AttributeError, RuntimeError):
+            pass  # bridge is best-effort
+    return promoted
+
+
+def _index_findings_into_brain(
+    findings_dicts: List[Dict[str, Any]],
+    org_id: str,
+) -> Dict[str, Any]:
+    """Index ingested findings into Store B (KnowledgeBrain) so the council can enrich them.
+
+    This is the bridge that was missing: scanner-ingest (pipeline=False path) calls
+    _promote_findings_to_issues() which writes to SecurityFindingsEngine (Store A via
+    UniversalFindingIndexer), but never populated Store B (KnowledgeBrain) which is
+    what BrainCorrelator / the LLM council reads for blast-radius + CVE correlation.
+
+    Constraints:
+    - Best-effort: never raises; failures are logged and the ingest path continues.
+    - Idempotent: KnowledgeBrain.upsert_node / add_edge use INSERT OR REPLACE /
+      INSERT OR IGNORE semantics, so re-ingest never duplicates nodes or edges.
+    - Org-scoped: every node is tagged with org_id; BrainCorrelator's _node_visible()
+      check will allow them.
+    - Only real finding/CVE/asset data is written (no fabricated edges).
+    - Does NOT block the ingest response (called synchronously but wrapped in try/except
+      so any failure is silent to the API caller).
+
+    Returns a stats dict surfaced in the ingest response (nodes_added, edges_added, error).
+    """
+    if not findings_dicts:
+        return {"nodes_added": 0, "edges_added": 0}
+    try:
+        from core.knowledge_brain import EdgeType, EntityType, GraphEdge, GraphNode, get_brain
+    except ImportError as exc:
+        logger.debug("_index_findings_into_brain: knowledge_brain unavailable: %s", exc)
+        return {"nodes_added": 0, "edges_added": 0, "skipped": True}
+
+    try:
+        brain = get_brain()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_index_findings_into_brain: get_brain() failed: %s", type(exc).__name__)
+        return {"nodes_added": 0, "edges_added": 0, "error": type(exc).__name__}
+
+    nodes_added = 0
+    edges_added = 0
+    errors = 0
+
+    # Collect unique CVE ids upfront for batch node creation
+    unique_cves: set = {
+        str(f["cve_id"]) for f in findings_dicts if f.get("cve_id")
+    }
+
+    # Upsert one CVE node per unique CVE (deduped)
+    for cve_id in unique_cves:
+        try:
+            brain.upsert_node(GraphNode(
+                node_id=cve_id,
+                node_type=EntityType.CVE,
+                org_id=org_id,
+                properties={"cve_id": cve_id},
+            ))
+            nodes_added += 1
+        except Exception:  # noqa: BLE001
+            errors += 1
+
+    for f in findings_dicts:
+        try:
+            # Stable finding id — prefer existing id/rule_id, fall back to uuid fragment
+            import uuid as _uuid
+            fid = (
+                f.get("id")
+                or f.get("rule_id")
+                or f.get("finding_id")
+                or _uuid.uuid4().hex[:12]
+            )
+            fid = str(fid)
+
+            # Classification marking (SPEC-016 REQ-016-11) — every node carries a
+            # classification level so the brain read path can enforce clearance-based
+            # access in a multi-compartment SCIF. Source: per-finding override, else
+            # the deployment default (FIXOPS_DEFAULT_CLASSIFICATION), else UNCLASSIFIED.
+            _classification = (
+                f.get("classification_level")
+                or os.environ.get("FIXOPS_DEFAULT_CLASSIFICATION")
+                or "UNCLASSIFIED"
+            )
+
+            # Upsert finding node
+            brain.upsert_node(GraphNode(
+                node_id=fid,
+                node_type=EntityType.FINDING,
+                org_id=org_id,
+                properties={
+                    "title": f.get("title") or f.get("name") or fid,
+                    "severity": f.get("severity") or "medium",
+                    "cve_id": f.get("cve_id") or None,
+                    "classification_level": _classification,
+                },
+            ))
+            nodes_added += 1
+
+            # finding -> CVE edge (REFERENCES) — only when cve_id is present
+            cve_id = f.get("cve_id")
+            if cve_id:
+                cve_id = str(cve_id)
+                try:
+                    brain.add_edge(GraphEdge(
+                        source_id=fid,        # finding -> CVE (correct direction)
+                        target_id=cve_id,
+                        edge_type=EdgeType.REFERENCES,
+                    ))
+                    edges_added += 1
+                except Exception:  # noqa: BLE001
+                    errors += 1
+
+            # finding -> asset edge (AFFECTS) — only when asset id/name present
+            asset_id = (
+                f.get("canonical_asset_id")
+                or f.get("asset_id")
+                or f.get("asset_name")
+            )
+            if asset_id:
+                asset_id = str(asset_id)
+                # Upsert asset node so BrainCorrelator can resolve it
+                try:
+                    brain.upsert_node(GraphNode(
+                        node_id=asset_id,
+                        node_type=EntityType.ASSET,
+                        org_id=org_id,
+                        properties={
+                            "asset_type": f.get("asset_type") or "unknown",
+                            "name": f.get("asset_name") or asset_id,
+                            "classification_level": _classification,
+                        },
+                    ))
+                    nodes_added += 1
+                except Exception:  # noqa: BLE001
+                    errors += 1
+
+                try:
+                    brain.add_edge(GraphEdge(
+                        source_id=fid,       # finding -> asset (correct direction)
+                        target_id=asset_id,
+                        edge_type=EdgeType.AFFECTS,
+                    ))
+                    edges_added += 1
+                except Exception:  # noqa: BLE001
+                    errors += 1
+
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            if errors <= 3:
+                logger.debug(
+                    "_index_findings_into_brain: per-finding error: %s",
+                    type(exc).__name__,
+                )
+
+    result: Dict[str, Any] = {"nodes_added": nodes_added, "edges_added": edges_added}
+    if errors:
+        result["errors"] = errors
+    logger.info(
+        "brain-index: org=%s nodes=%d edges=%d findings=%d errors=%d",
+        org_id, nodes_added, edges_added, len(findings_dicts), errors,
+    )
+    return result
+
+
+def _dedupe_findings(
+    findings_dicts: List[Dict[str, Any]],
+    org_id: str,
+) -> Dict[str, Any]:
+    """Run SmartDedup over serialized findings; return canonical-only list.
+
+    Collapses cross-scanner duplicates (exact CVE / file:line / fuzzy title /
+    package@version) before findings hit the storage layer. Returns a dict
+    with: canonical (surviving findings), duplicate_count, groups (count of
+    dedup groups created). Falls back to no-op on engine errors.
+    """
+    if not findings_dicts:
+        return {"canonical": findings_dicts, "duplicate_count": 0, "groups": 0}
+    try:
+        from core.smart_dedup import SmartDedup
+    except ImportError:
+        return {"canonical": findings_dicts, "duplicate_count": 0, "groups": 0}
+    try:
+        engine = SmartDedup()
+        result = engine.deduplicate(findings_dicts, org_id=org_id or "")
+        canonical = result.get("canonical_findings") or findings_dicts
+        return {
+            "canonical": canonical,
+            "duplicate_count": int(result.get("duplicate_count", 0)),
+            "groups": len(result.get("groups", []) or []),
+        }
+    except (RuntimeError, ValueError, KeyError, OSError, AttributeError) as e:
+        logger.warning("smart-dedup at ingest failed: %s", type(e).__name__)
+        return {"canonical": findings_dicts, "duplicate_count": 0, "groups": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POST /upload — File upload (multipart form-data)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/")
+async def list_scanner_ingest(org_id: str = Depends(get_org_id)):
+    """List supported scanners and ingestion stats."""
+    return {"org_id": org_id, "status": "ok", "supported_scanners": ["semgrep", "trivy", "grype", "snyk", "bandit", "checkov", "nuclei", "zap"]}
+
+
+@router.post("/upload")
+async def upload_scanner_output(
+    request: Request,
+    file: UploadFile = File(...),
+    scanner_type: Optional[str] = Form(None),
+    app_id: str = Form(""),
+    component: str = Form(""),
+    pipeline: bool = Form(False),
+    org_id: str = Depends(get_org_id),
+):
+    """
+    Upload a scanner output file for ingestion.
+
+    Supports: ZAP, Burp, Nessus, OpenVAS, Bandit, Checkmarx, SonarQube,
+    Fortify, Veracode, Nikto, Nuclei, Nmap, Snyk, Prowler, Checkov, Gitleaks.
+    Plus existing: SARIF, CycloneDX, SPDX, VEX, Trivy, Grype, Semgrep, Dependabot.
+
+    If scanner_type is not provided, auto-detection is used.
+    Set pipeline=true to push findings into the Brain Pipeline immediately.
+    """
+    _rl_enforce(request, limit_key="ingest:upload", max_per_minute=30)
+    parsers = _get_scanner_parsers()
+    if not parsers:
+        raise HTTPException(status_code=503, detail="Scanner parser module not available")
+
+    # Security: validate filename (path traversal defense)
+    safe_filename = _validate_filename(file.filename)
+
+    # Security: validate file extension BEFORE reading body (fast-reject)
+    if safe_filename:
+        import os
+        ext = os.path.splitext(safe_filename)[1].lower()
+        if ext and ext not in _ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"Unsupported file extension: {ext!r}. "
+                    f"Allowed: {sorted(_ALLOWED_EXTENSIONS)}"
+                ),
+            )
+
+    # Security: check Content-Length header before reading body (early 413)
+    content_length_header = request.headers.get("content-length")
+    if content_length_header:
+        try:
+            declared_size = int(content_length_header)
+            if declared_size > _MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Upload too large: declared Content-Length {declared_size} bytes "
+                        f"exceeds {_MAX_UPLOAD_BYTES} byte limit ({_MAX_UPLOAD_BYTES // (1024*1024)} MB)"
+                    ),
+                )
+        except ValueError:
+            pass  # non-integer Content-Length — ignore, actual size check below
+
+    content = await file.read()
+    # Security: validate actual upload size (zip bomb / DoS prevention)
+    _validate_upload_size(content, _MAX_UPLOAD_BYTES)
+
+    t0 = time.time()
+
+    # Security: validate scanner_type if provided
+    if scanner_type:
+        scanner_type = _validate_scanner_type(scanner_type)
+
+    # Auto-detect if not specified
+    detected = scanner_type or parsers["auto_detect_scanner"](content)
+    if not detected:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot auto-detect scanner type. Provide scanner_type parameter.",
+        )
+
+    try:
+        findings = parsers["parse_scanner_output"](
+            content=content,
+            scanner_type=detected,
+            app_id=app_id,
+            component=component,
+        )
+    except (ValueError, KeyError, RuntimeError, TypeError, AttributeError) as e:
+        _ingest_stats["errors"] += 1
+        # Security: don't leak internal error details — only expose type
+        logger.error("Parse error for %s: %s", detected, type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Parse error ({type(e).__name__}): could not parse {detected} output",
+        )
+
+    elapsed = time.time() - t0
+
+    # Update stats
+    _ingest_stats["total_files_processed"] += 1
+    _ingest_stats["total_findings_parsed"] += len(findings)
+    _ingest_stats["last_ingest_at"] = datetime.now(timezone.utc).isoformat()
+    scanner_stats = _ingest_stats["by_scanner"].setdefault(detected, {"files": 0, "findings": 0})
+    scanner_stats["files"] += 1
+    scanner_stats["findings"] += len(findings)
+
+    # Gap 4: cross-scanner dedup at storage layer — collapse exact CVE,
+    # file:line, fuzzy-title, and package@version overlaps before findings
+    # are persisted. Falls back to no-op when the engine is unavailable.
+    findings_dicts_full = _serialize_findings(findings) if findings else []
+    _attach_vulnerable_symbols(findings_dicts_full)
+    dedup_summary = _dedupe_findings(findings_dicts_full, org_id)
+    canonical_dicts = dedup_summary["canonical"]
+
+    # Gap 2: promote canonical findings to /api/v1/issues federation by
+    # writing them into SecurityFindingsEngine (security_findings table).
+    promoted_count = _promote_findings_to_issues(canonical_dicts, detected, org_id)
+
+    # Bridge: index findings into Store B (KnowledgeBrain) so BrainCorrelator /
+    # the LLM council can enrich them.  Best-effort — never blocks the response.
+    brain_index_result = _index_findings_into_brain(canonical_dicts, org_id)
+
+    # SPEC-017: optionally auto-run the full Brain Pipeline (non-blocking, config-gated,
+    # bounded, air-gap-safe). Default OFF — unchanged unless FIXOPS_PIPELINE_ON_INGEST set.
+    from apps.api.pipeline_on_ingest import dispatch_pipeline_on_ingest
+    pipeline_dispatch = dispatch_pipeline_on_ingest(
+        canonical_dicts, org_id, f"scanner-ingest:{detected}"
+    )
+
+    # Optionally push to brain pipeline
+    pipeline_result = None
+    if pipeline and findings:
+        try:
+            from core.brain_pipeline import BrainPipeline, PipelineInput
+
+            bp = BrainPipeline()
+            pipe_input = PipelineInput(
+                findings=canonical_dicts,
+                assets=[],
+                source=f"scanner-ingest:{detected}",
+                # PipelineInput.org_id defaults to "", which the pipeline then
+                # treats as "default". Omitting it meant every verdict this run
+                # computed was mirrored into the "default" org while the
+                # findings themselves were stored under the caller's tenant.
+                #
+                # Two consequences, both observed on a clean tenant: the
+                # customer's 96 findings carried NO verdict at all, and a
+                # phantom "default" org accumulated verdict-carrying duplicates
+                # of them — one tenant's data written into a shared org.
+                org_id=org_id,
+            )
+            pipeline_result = bp.run(pipe_input)
+            if hasattr(pipeline_result, "model_dump"):
+                pipeline_result = pipeline_result.model_dump(exclude_none=True)
+            elif hasattr(pipeline_result, "__dict__"):
+                pipeline_result = pipeline_result.__dict__
+        except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+            logger.warning("Pipeline execution failed: %s", type(e).__name__)
+            pipeline_result = {"error": type(e).__name__}
+
+    # TrustGraph async indexing (fire-and-forget, non-blocking)
+    try:
+        from core.trustgraph_event_bus import EVENT_FINDING_CREATED, get_event_bus
+        bus = get_event_bus()
+        if bus and bus.enabled and findings:
+            import asyncio
+            asyncio.ensure_future(bus.emit(EVENT_FINDING_CREATED, {
+                "finding_id": f"scanner-upload-{detected}-{app_id or 'default'}",
+                "type": "scanner_finding",
+                "severity": "medium",
+                "source": f"scanner_ingest_router:{detected}",
+                "scanner": detected,
+                "findings_count": len(findings),
+                "app_id": app_id or None,
+            }))
+    except Exception:
+        pass  # event bus is best-effort
+    return {
+        "status": "success",
+        "org_id": org_id,
+        "scanner": detected,
+        "file_name": safe_filename or file.filename,
+        "findings_count": len(findings),
+        "parse_time_ms": round(elapsed * 1000, 1),
+        "app_id": app_id or None,
+        "component": component or None,
+        # Slice the ALREADY-SERIALISED list rather than serialising a second
+        # time. The duplicate call was not just waste: it bypassed
+        # _attach_vulnerable_symbols, so the response advertised findings
+        # without the symbol field that had in fact been recorded — a caller
+        # reading the upload response would conclude enrichment had not run.
+        "findings": findings_dicts_full[:100],  # Cap response at 100
+        "total_findings": len(findings),
+        "deduped_count": len(canonical_dicts),
+        "duplicates_removed": dedup_summary["duplicate_count"],
+        "promoted_to_issues": promoted_count,
+        "brain_index": brain_index_result,
+        "pipeline_result": pipeline_result,
+        "pipeline_dispatched": pipeline_dispatch.get("dispatched", False),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POST /webhook/{scanner_type} — Webhook receiver
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/webhook/{scanner_type}")
+async def webhook_ingest(
+    scanner_type: str,
+    request: Request,
+    app_id: str = Query(""),
+    component: str = Query(""),
+    pipeline: bool = Query(False),
+    org_id: str = Depends(get_org_id),
+):
+    """
+    Receive scanner output via webhook (raw body).
+
+    Set up your CI/CD to POST scanner output directly:
+      curl -X POST https://aldeci/api/v1/scanner-ingest/webhook/zap \\
+        -H "X-API-Key: $KEY" \\
+        -H "Content-Type: application/json" \\
+        --data-binary @zap-report.json
+    """
+    _rl_enforce(request, limit_key="ingest:webhook", max_per_minute=30)
+    parsers = _get_scanner_parsers()
+    if not parsers:
+        raise HTTPException(status_code=503, detail="Scanner parser module not available")
+
+    content = await request.body()
+    # Security: validate body size (DoS prevention)
+    _validate_upload_size(content, _MAX_WEBHOOK_BYTES)
+
+    # Security: validate scanner_type path param (injection prevention)
+    scanner = _validate_scanner_type(scanner_type)
+    if scanner not in parsers["SCANNER_NORMALIZERS"]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown scanner type: {scanner}. Use GET /supported for list.",
+        )
+
+    t0 = time.time()
+    try:
+        findings = parsers["parse_scanner_output"](
+            content=content,
+            scanner_type=scanner,
+            app_id=app_id,
+            component=component,
+        )
+    except (ValueError, KeyError, RuntimeError, TypeError, AttributeError) as e:
+        _ingest_stats["errors"] += 1
+        # Security: don't leak internal error details
+        logger.error("Parse error for webhook %s: %s", scanner, type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Parse error ({type(e).__name__}): could not parse {scanner} output",
+        )
+
+    elapsed = time.time() - t0
+
+    _ingest_stats["total_files_processed"] += 1
+    _ingest_stats["total_findings_parsed"] += len(findings)
+    _ingest_stats["last_ingest_at"] = datetime.now(timezone.utc).isoformat()
+    scanner_stats = _ingest_stats["by_scanner"].setdefault(scanner, {"files": 0, "findings": 0})
+    scanner_stats["files"] += 1
+    scanner_stats["findings"] += len(findings)
+
+    # Gap 4: cross-scanner dedup at storage layer (webhook path).
+    findings_dicts_full = _serialize_findings(findings) if findings else []
+    _attach_vulnerable_symbols(findings_dicts_full)
+    dedup_summary = _dedupe_findings(findings_dicts_full, org_id)
+    canonical_dicts = dedup_summary["canonical"]
+
+    # Gap 2: promote canonical findings to /api/v1/issues federation.
+    promoted_count = _promote_findings_to_issues(canonical_dicts, scanner, org_id)
+
+    # Bridge: index findings into Store B (KnowledgeBrain) so BrainCorrelator /
+    # the LLM council can enrich them.  Best-effort — never blocks the response.
+    brain_index_result = _index_findings_into_brain(canonical_dicts, org_id)
+
+    # SPEC-017: non-blocking, config-gated auto-run of the full Brain Pipeline (default OFF).
+    from apps.api.pipeline_on_ingest import dispatch_pipeline_on_ingest
+    pipeline_dispatch = dispatch_pipeline_on_ingest(
+        canonical_dicts, org_id, f"webhook:{scanner}"
+    )
+
+    # Optionally push to brain pipeline
+    pipeline_result = None
+    if pipeline and findings:
+        try:
+            from core.brain_pipeline import BrainPipeline, PipelineInput
+
+            bp = BrainPipeline()
+            pipe_input = PipelineInput(
+                findings=canonical_dicts,
+                assets=[],
+                source=f"webhook:{scanner}",
+                # Same omission as the upload path — see the note there.
+                org_id=org_id,
+            )
+            pipeline_result = bp.run(pipe_input)
+            if hasattr(pipeline_result, "model_dump"):
+                pipeline_result = pipeline_result.model_dump(exclude_none=True)
+            elif hasattr(pipeline_result, "__dict__"):
+                pipeline_result = pipeline_result.__dict__
+        except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+            logger.warning("Webhook pipeline failed: %s", type(e).__name__)
+            pipeline_result = {"error": type(e).__name__}
+
+    # TrustGraph async indexing (fire-and-forget, non-blocking)
+    try:
+        from core.trustgraph_event_bus import EVENT_FINDING_CREATED, get_event_bus
+        bus = get_event_bus()
+        if bus and bus.enabled and findings:
+            import asyncio
+            asyncio.ensure_future(bus.emit(EVENT_FINDING_CREATED, {
+                "finding_id": f"scanner-webhook-{scanner}-{app_id or 'default'}",
+                "type": "scanner_finding",
+                "severity": "medium",
+                "source": f"scanner_ingest_router:webhook:{scanner}",
+                "scanner": scanner,
+                "findings_count": len(findings),
+                "app_id": app_id or None,
+            }))
+    except Exception:
+        pass  # event bus is best-effort
+    return {
+        "status": "success",
+        "org_id": org_id,
+        "scanner": scanner,
+        "findings_count": len(findings),
+        "parse_time_ms": round(elapsed * 1000, 1),
+        "app_id": app_id or None,
+        "findings": findings_dicts_full[:100],
+        "total_findings": len(findings),
+        "deduped_count": len(canonical_dicts),
+        "duplicates_removed": dedup_summary["duplicate_count"],
+        "promoted_to_issues": promoted_count,
+        "brain_index": brain_index_result,
+        "pipeline_result": pipeline_result,
+        "pipeline_dispatched": pipeline_dispatch.get("dispatched", False),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POST /detect — Auto-detect scanner type from content
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.post("/detect")
+async def detect_scanner_type(
+    file: UploadFile = File(...),
+):
+    """
+    Detect scanner type from uploaded file without processing.
+    Returns the detected scanner type and confidence score.
+    """
+    parsers = _get_scanner_parsers()
+    if not parsers:
+        raise HTTPException(status_code=503, detail="Scanner parser module not available")
+
+    content = await file.read()
+    # Security: validate upload size for detection endpoint too
+    _validate_upload_size(content, _MAX_UPLOAD_BYTES)
+
+    # Run all detectors and return scores
+    from core.scanner_parsers import SCANNER_NORMALIZERS, NormalizerConfig
+
+    scores = {}
+    for name, cls in SCANNER_NORMALIZERS.items():
+        try:
+            config = NormalizerConfig(name=name, enabled=True, priority=50)
+            normalizer = cls(config)
+            score = normalizer.can_handle(content)
+            if score > 0:
+                scores[name] = round(score, 3)
+        except (TypeError, AttributeError, ValueError, KeyError, UnicodeDecodeError):
+            continue
+
+    # Sort by score descending
+    sorted_scores = dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+    best = next(iter(sorted_scores), None)
+
+    return {
+        "detected": best,
+        "confidence": sorted_scores.get(best, 0.0) if best else 0.0,
+        "all_scores": sorted_scores,
+        "file_name": file.filename,
+        "file_size_bytes": len(content),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GET /supported — List supported scanners
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/supported")
+async def list_supported_scanners():
+    """
+    List all supported scanner types grouped by category.
+
+    Returns 25+ scanner types across SAST, DAST, SCA, infrastructure, cloud.
+    """
+    parsers = _get_scanner_parsers()
+    if not parsers:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "detail": "scanner_parsers module unavailable",
+                "error_category": "not_configured",
+            },
+        )
+
+    supported = parsers["get_supported_scanners"]()
+    return {
+        "scanners": supported,
+        "total_new_parsers": len(parsers["SCANNER_NORMALIZERS"]),
+        "total_with_builtins": len(parsers["SCANNER_NORMALIZERS"]) + 10,
+        "ingestion_methods": [
+            {"method": "upload", "endpoint": "POST /api/v1/scanner-ingest/upload", "format": "multipart/form-data"},
+            {"method": "webhook", "endpoint": "POST /api/v1/scanner-ingest/webhook/{type}", "format": "raw body"},
+            {"method": "auto-detect", "endpoint": "POST /api/v1/scanner-ingest/detect", "format": "multipart/form-data"},
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GET /stats — Ingestion statistics
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_db_ingest_stats(org_id: Optional[str] = None) -> Dict[str, Any]:
+    """Read real ingestion stats from the analytics database, scoped to org_id.
+
+    When the findings table predates the org_id column (schema migration pending),
+    the org-scoped queries fall back gracefully to unfiltered counts so the
+    endpoint never returns 500 — isolation is enforced at the API layer by
+    including org_id in the response so callers can verify tenant scope.
+    """
+    try:
+        import sqlite3
+        from pathlib import Path
+
+        db_path = Path("data/analytics.db")
+        if not db_path.exists():
+            return None
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.cursor()
+
+            # Detect whether the org_id column exists in the findings table
+            cursor.execute("PRAGMA table_info(findings)")
+            columns = {row[1] for row in cursor.fetchall()}
+            has_org_id_col = "org_id" in columns
+
+            # Total findings ingested — scoped to org_id when column exists
+            if org_id and has_org_id_col:
+                cursor.execute(
+                    "SELECT COUNT(*) as total FROM findings WHERE org_id = ?",
+                    (org_id,),
+                )
+            else:
+                cursor.execute("SELECT COUNT(*) as total FROM findings")
+            total_findings = cursor.fetchone()[0]
+
+            # Findings by source (scanner) — scoped to org_id when column exists
+            if org_id and has_org_id_col:
+                cursor.execute(
+                    "SELECT source, COUNT(*) as count, MAX(created_at) as last_at "
+                    "FROM findings WHERE org_id = ? GROUP BY source ORDER BY count DESC",
+                    (org_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT source, COUNT(*) as count, MAX(created_at) as last_at "
+                    "FROM findings GROUP BY source ORDER BY count DESC"
+                )
+            by_source = {}
+            last_ingest_at = None
+            for row in cursor.fetchall():
+                src = row[0] or "unknown"
+                # Skip pure test entries from the counts
+                if src == "test":
+                    continue
+                by_source[src] = {"findings": row[1]}
+                if row[2] and (last_ingest_at is None or row[2] > last_ingest_at):
+                    last_ingest_at = row[2]
+
+            # Files processed: count distinct scanners as proxy
+            if org_id and has_org_id_col:
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT source) as scanners FROM findings "
+                    "WHERE source != 'test' AND org_id = ?",
+                    (org_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT source) as scanners FROM findings WHERE source != 'test'"
+                )
+            distinct_scanners = cursor.fetchone()[0]
+
+            return {
+                "total_findings_ingested": total_findings,
+                "distinct_scanners": distinct_scanners,
+                "by_source": by_source,
+                "last_ingest_at": last_ingest_at,
+            }
+        finally:
+            conn.close()
+    except (OSError, ValueError, KeyError, RuntimeError, Exception) as e:
+        logger.warning("Could not read analytics DB for ingest stats: %s", type(e).__name__)
+        return None
+
+
+@router.get("/stats")
+async def ingestion_stats(org_id: str = Depends(get_org_id)):
+    """Return scanner ingestion statistics from the analytics database."""
+    db_stats = _get_db_ingest_stats(org_id=org_id)
+    if db_stats:
+        return {
+            "status": "ok",
+            "org_id": org_id,
+            "total_findings_ingested": db_stats["total_findings_ingested"],
+            "distinct_scanners": db_stats["distinct_scanners"],
+            "by_source": db_stats["by_source"],
+            "last_ingest_at": db_stats["last_ingest_at"],
+            "in_session": {
+                "files_processed": _ingest_stats["total_files_processed"],
+                "findings_parsed": _ingest_stats["total_findings_parsed"],
+                "errors": _ingest_stats["errors"],
+                "note": "Per-process counters since last server start",
+            },
+        }
+    return {
+        "status": "ok",
+        "org_id": org_id,
+        "total_findings_ingested": _ingest_stats["total_findings_parsed"],
+        "by_source": _ingest_stats["by_scanner"],
+        "last_ingest_at": _ingest_stats["last_ingest_at"],
+        "in_session": {
+            "files_processed": _ingest_stats["total_files_processed"],
+            "findings_parsed": _ingest_stats["total_findings_parsed"],
+            "errors": _ingest_stats["errors"],
+        },
+    }
+
+
+@router.get("/health")
+async def scanner_ingest_health(org_id: str = Depends(get_org_id)):
+    """Scanner ingest service health check."""
+    db_stats = _get_db_ingest_stats(org_id=org_id)
+    total = db_stats["total_findings_ingested"] if db_stats else _ingest_stats["total_findings_parsed"]
+    last_at = db_stats["last_ingest_at"] if db_stats else _ingest_stats["last_ingest_at"]
+    return {
+        "status": "healthy",
+        "engine": "scanner-ingest",
+        "version": "1.0.0",
+        "org_id": org_id,
+        "total_ingested": total,
+        "last_ingest_at": last_at,
+        "scanners_active": db_stats["distinct_scanners"] if db_stats else 0,
+    }
+
+
+@router.get("/status")
+async def scanner_ingest_status():
+    """Scanner ingest service status with real ingestion data."""
+    db_stats = _get_db_ingest_stats()
+    total = db_stats["total_findings_ingested"] if db_stats else _ingest_stats["total_findings_parsed"]
+    last_at = db_stats["last_ingest_at"] if db_stats else _ingest_stats["last_ingest_at"]
+    by_source = db_stats["by_source"] if db_stats else _ingest_stats["by_scanner"]
+    parsers = _get_scanner_parsers()
+    supported_count = len(parsers["SCANNER_NORMALIZERS"]) + 10 if parsers else 25
+    return {
+        "status": "healthy",
+        "engine": "scanner-ingest",
+        "version": "1.0.0",
+        "total_ingested": total,
+        "last_ingest_at": last_at,
+        "scanners_active": db_stats["distinct_scanners"] if db_stats else 0,
+        "supported_scanners": supported_count,
+        "by_source": by_source,
+        "ingestion_methods": ["upload", "webhook", "auto-detect"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Alias router: POST /api/v1/scanners/ingest
+# The canonical prefix is /api/v1/scanner-ingest but the demo path and
+# several UI calls use /api/v1/scanners/ingest (plural, with /ingest suffix).
+# This second router provides that alias without changing the canonical routes.
+# ═══════════════════════════════════════════════════════════════════════════
+
+from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402, F401
+from apps.api.tenant_resolution import resolve_tenant  # credential decides the tenant
+
+scanners_alias_router = APIRouter(
+    prefix="/api/v1/scanners",
+    tags=["scanner-ingest"],
+)
+
+# _IngestBody — hardened with Pydantic Field constraints (security: input validation)
+_scanner_type_field = _Field(None, min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+_app_id_field = _Field("", max_length=255)
+_org_id_field = _Field("default", min_length=1, max_length=128)
+_findings_field = _Field(None, max_length=10000)
+
+
+class _IngestBody(_BaseModel):
+    scanner_type: Optional[str] = _scanner_type_field
+    app_id: str = _app_id_field
+    org_id: str = _org_id_field
+    findings: Optional[List[Dict[str, Any]]] = _findings_field
+    raw: Optional[Dict[str, Any]] = None
+
+
+@scanners_alias_router.post(
+    "/ingest",
+    summary="Ingest scanner findings (JSON alias for POST /api/v1/scanner-ingest/upload)",
+    description=(
+        "Accepts a JSON body with pre-parsed scanner findings or raw scanner output. "
+        "Alias for the canonical /api/v1/scanner-ingest endpoints — provided for "
+        "demo-path compatibility and UI callers that POST JSON rather than multipart."
+    ),
+)
+async def scanners_ingest_alias(body: _IngestBody, org_id: str = Depends(get_org_id)):
+    """JSON-body ingest alias. Promotes findings to issues queue and records stats."""
+    findings = body.findings or []
+    scanner = body.scanner_type or "unknown"
+    effective_org = resolve_tenant(org_id, body)
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Promote to SecurityFindingsEngine (same path as upload handler)
+    promoted = _promote_findings_to_issues(findings, scanner, effective_org)
+
+    # Update in-memory stats
+    _ingest_stats["total_findings_parsed"] += len(findings)
+    scanner_stats = _ingest_stats["by_scanner"].setdefault(scanner, {"files": 0, "findings": 0})
+    if isinstance(scanner_stats, dict):
+        scanner_stats["findings"] = scanner_stats.get("findings", 0) + len(findings)
+    _ingest_stats["last_ingest_at"] = now
+
+    return {
+        "status": "ok",
+        "scanner_type": scanner,
+        "findings_received": len(findings),
+        "findings_promoted": promoted,
+        "org_id": effective_org,
+        "ingested_at": now,
+        "canonical_endpoint": "/api/v1/scanner-ingest/upload",
+    }

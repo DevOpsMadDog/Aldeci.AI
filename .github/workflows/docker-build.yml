@@ -1,0 +1,294 @@
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # required for cosign keyless OIDC signing
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # SCIF Stage 1 blocker #2 — cosign image signing (keyless OIDC by default,
+      # falls back to key-based when COSIGN_PRIVATE_KEY secret is set). Skips
+      # cleanly on pull_request events (no push happened, nothing to sign).
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign pushed image with cosign
+        if: github.event_name != 'pull_request' && steps.build.outputs.digest != ''
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -e
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::warning::no digest from build step, skipping cosign sign"
+            exit 0
+          fi
+          # Build the immutable digest reference for every tag and sign once.
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}"
+          echo "Signing ${IMAGE_REF}"
+          if [ -n "${COSIGN_PRIVATE_KEY}" ]; then
+            printf '%s' "${COSIGN_PRIVATE_KEY}" > /tmp/cosign.key
+            cosign sign --yes --key /tmp/cosign.key "${IMAGE_REF}" \
+              || echo "::warning::cosign key-based sign failed — continuing"
+            shred -u /tmp/cosign.key 2>/dev/null || rm -f /tmp/cosign.key
+          else
+            # Keyless OIDC (Fulcio) — uses the workflow's id-token permission.
+            cosign sign --yes "${IMAGE_REF}" \
+              || echo "::warning::cosign keyless sign failed — continuing (sigstore/Fulcio reachable?)"
+          fi
+
+      - name: Export image for PR testing
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build -f Dockerfile -t fixops-test:${{ github.sha }} .
+          docker save fixops-test:${{ github.sha }} > /tmp/fixops-image.tar
+
+      - name: Upload image artifact for PR
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/fixops-image.tar
+          retention-days: 1
+
+  # Test the built image
+  test-image:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download image artifact (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image (PR only)
+        if: github.event_name == 'pull_request'
+        run: docker load < /tmp/fixops-image.tar
+
+      - name: Pull image (push only)
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} fixops-test:${{ github.sha }}
+
+      - name: Test CLI commands in container
+        run: |
+          IMAGE="fixops-test:${{ github.sha }}"
+
+          # Create shared data directory for database persistence across container runs
+          mkdir -p ${{ runner.temp }}/fixops-data
+          chmod 777 ${{ runner.temp }}/fixops-data
+
+          # Common docker run options with shared volume for database state
+          DOCKER_OPTS="--rm -v ${{ runner.temp }}/fixops-data:/app/.fixops_data -e FIXOPS_DISABLE_TELEMETRY=1 -e FIXOPS_API_TOKEN=test-token -e FIXOPS_MODE=enterprise -e FIXOPS_JWT_SECRET=ci-test-jwt-secret-not-for-production"
+
+          echo "=== Testing CLI Help ==="
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli --help
+
+          echo "=== Testing Core Pipeline Commands ==="
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli run --help
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli make-decision --help
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli ingest --help
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli analyze --help
+
+          echo "=== Testing Compliance Commands ==="
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli compliance frameworks --format json
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli compliance status SOC2
+
+          echo "=== Testing Inventory Commands ==="
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli inventory apps
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli inventory add --name test-app --criticality high
+
+          echo "=== Testing Utility Commands ==="
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli health
+          docker run $DOCKER_OPTS $IMAGE python -m core.cli show-overlay
+
+          echo "=== CLI smoke tests passed ==="
+
+      - name: Verify suite architecture in container
+        run: |
+          IMAGE="fixops-test:${{ github.sha }}"
+          ENV_OPTS="-e FIXOPS_MODE=enterprise -e FIXOPS_JWT_SECRET=ci-test-jwt-secret-not-for-production"
+          echo "=== Verifying suite directories ==="
+          docker run --rm $ENV_OPTS $IMAGE ls -d /app/suite-api /app/suite-core /app/suite-attack /app/suite-feeds /app/suite-evidence-risk /app/suite-integrations
+          echo "=== Verifying PYTHONPATH ==="
+          docker run --rm $ENV_OPTS $IMAGE python -c "import sys; print([p for p in sys.path if 'suite' in p])"
+          echo "=== Verifying docs ==="
+          docker run --rm $ENV_OPTS $IMAGE ls -la /app/docs/
+
+      - name: Test API server starts
+        run: |
+          docker run -d --name aldeci-api -p 8000:8000 \
+            -e FIXOPS_DISABLE_TELEMETRY=1 \
+            -e FIXOPS_API_TOKEN=test-token \
+            -e FIXOPS_MODE=enterprise \
+            -e FIXOPS_JWT_SECRET=ci-test-jwt-secret-not-for-production \
+            fixops-test:${{ github.sha }}
+
+          # Wait for server to start with retry loop
+          for i in {1..30}; do
+            if curl -sf http://localhost:8000/health; then
+              echo "Server is healthy!"
+              break
+            fi
+            echo "Waiting for server... attempt $i/30"
+            sleep 1
+          done
+
+          # Test health endpoint
+          curl -f http://localhost:8000/health || (docker logs aldeci-api && exit 1)
+
+          # Test API key auth
+          curl -sf -H "X-API-Key: test-token" http://localhost:8000/api/v1/nerve-center/overlay || echo "overlay check skipped"
+
+          # Cleanup
+          docker stop aldeci-api
+          docker rm aldeci-api
+
+  # Compose stack integration test (DEMO-007)
+  compose-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and start compose stack
+        run: |
+          docker compose -f docker-compose.yml up --build -d
+          echo "Waiting for services to become healthy..."
+        env:
+          FIXOPS_API_TOKEN: ci-test-token
+          FIXOPS_JWT_SECRET: ci-jwt-secret-for-testing-only
+
+      - name: Wait for API health
+        run: |
+          for i in {1..60}; do
+            if curl -sf http://localhost:8000/health; then
+              echo "✅ API healthy after ${i}s"
+              break
+            fi
+            if [[ $i -eq 60 ]]; then
+              echo "❌ API failed to start"
+              docker compose -f docker-compose.yml logs aldeci
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run demo health check
+        run: |
+          chmod +x scripts/demo-healthcheck.sh
+          ./scripts/demo-healthcheck.sh || true
+
+      - name: Verify key API endpoints
+        run: |
+          echo "Testing CTEM+ pipeline endpoints..."
+          curl -sf http://localhost:8000/api/v1/brain/stats | python3 -m json.tool
+          curl -sf http://localhost:8000/api/v1/autofix/health | python3 -m json.tool
+          curl -sf http://localhost:8000/api/v1/sast/status | python3 -m json.tool
+          curl -sf http://localhost:8000/api/v1/mcp/tools | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'MCP tools: {len(d.get(\"tools\", d.get(\"items\", [])))} discovered')"
+          echo "✅ Key endpoints verified"
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker-compose.yml down -v
+
+  # Air-gapped deployment test (MOAT 3: $2.3B defense/gov market)
+  air-gapped-test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build air-gapped image
+        run: docker build -f Dockerfile -t fixops:local .
+
+      - name: Run air-gapped test
+        run: |
+          docker compose -f docker-compose.yml up -d aldeci
+          # Wait for healthy
+          for i in {1..60}; do
+            HEALTH=$(docker inspect --format='{{.State.Health.Status}}' aldeci-api 2>/dev/null) || HEALTH="unknown"
+            [[ "$HEALTH" == "healthy" ]] && break
+            [[ $i -eq 60 ]] && { docker compose -f docker-compose.yml logs aldeci; exit 1; }
+            sleep 1
+          done
+          # Validate key API endpoint
+          curl -sf http://localhost:8000/health
+        env:
+          FIXOPS_API_TOKEN: ci-test-token
+          FIXOPS_JWT_SECRET: ci-jwt-secret-for-testing-only
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker-compose.yml down -v

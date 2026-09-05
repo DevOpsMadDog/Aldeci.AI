@@ -1,0 +1,190 @@
+"""
+Enterprise database session management with connection pooling and performance optimization
+"""
+
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+import structlog
+from config.enterprise.settings import get_settings
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import QueuePool
+
+logger = structlog.get_logger()
+settings = get_settings()
+
+
+class DatabaseManager:
+    """Enterprise database manager with connection pooling and health monitoring"""
+
+    _engine = None
+    _sessionmaker = None
+
+    @classmethod
+    async def initialize(cls):
+        """Initialize database engine with enterprise configuration"""
+        if cls._engine is not None:
+            return
+
+        # Ensure async-compatible URL (sqlite:// → sqlite+aiosqlite://)
+        db_url = settings.DATABASE_URL
+        if db_url.startswith("sqlite://") and "+aiosqlite" not in db_url:
+            db_url = db_url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+
+        # Build engine kwargs — SQLite uses StaticPool, Postgres uses QueuePool
+        is_sqlite = "sqlite" in db_url
+        engine_kwargs: dict = {
+            "echo": settings.DEBUG,
+            "echo_pool": settings.DEBUG,
+            "future": True,
+        }
+        if is_sqlite:
+            from sqlalchemy.pool import StaticPool
+
+            engine_kwargs.update(
+                poolclass=StaticPool,
+                connect_args={"check_same_thread": False},
+            )
+        else:
+            engine_kwargs.update(
+                poolclass=QueuePool,
+                pool_size=settings.DATABASE_POOL_SIZE,
+                max_overflow=settings.DATABASE_MAX_OVERFLOW,
+                pool_timeout=settings.DATABASE_POOL_TIMEOUT,
+                pool_recycle=3600,
+                pool_pre_ping=True,
+                connect_args={
+                    "server_settings": {
+                        "application_name": "fixops-enterprise",
+                        "jit": "off",
+                    }
+                },
+            )
+
+        # Create async engine
+        cls._engine = create_async_engine(db_url, **engine_kwargs)
+
+        # Create session factory
+        cls._sessionmaker = async_sessionmaker(
+            cls._engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=True,
+            autocommit=False,
+        )
+
+        # Issue 3: create tables (CREATE TABLE IF NOT EXISTS) so pipeline_runs
+        # and other SQLAlchemy models exist without requiring Alembic in dev/test.
+        try:
+            from core.db.models import Base as _ModelsBase  # noqa: PLC0415
+            async with cls._engine.begin() as _conn:
+                await _conn.run_sync(_ModelsBase.metadata.create_all)
+            logger.info("Enterprise database tables ensured (create_all)")
+        except Exception as _exc:  # noqa: BLE001
+            # Table creation failure must never prevent startup
+            logger.warning("Enterprise table creation failed (non-fatal): %s", _exc)
+
+        # Also ensure the enterprise SECURITY models exist (security_findings,
+        # finding_correlations, security_incidents, policy_rules, vulnerability_
+        # intelligence, etc.). These live on a SEPARATE declarative Base
+        # (core.models.enterprise.base_sqlite.Base) that the create_all above
+        # does NOT cover, so on a fresh DB the correlation/findings engines hit
+        # "no such table: security_findings". The two Bases are table-disjoint
+        # and create_all is CREATE TABLE IF NOT EXISTS, so this is purely additive.
+        try:
+            from core.models.enterprise import security_sqlite as _sec  # noqa: F401,PLC0415  (registers models)
+            from core.models.enterprise.base_sqlite import Base as _SecBase  # noqa: PLC0415
+            async with cls._engine.begin() as _conn:
+                await _conn.run_sync(_SecBase.metadata.create_all)
+            logger.info("Enterprise security tables ensured (create_all)")
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("Enterprise security table creation failed (non-fatal): %s", _exc)
+
+        # Set up connection event handlers
+        cls._setup_event_handlers()
+
+        logger.info(
+            "Database engine initialized",
+            pool_size=settings.DATABASE_POOL_SIZE,
+            max_overflow=settings.DATABASE_MAX_OVERFLOW,
+        )
+
+    @classmethod
+    def _setup_event_handlers(cls):
+        """Setup database event handlers for monitoring and optimization"""
+
+        @event.listens_for(cls._engine.sync_engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            """Set database connection parameters for performance"""
+            if "postgresql" in settings.DATABASE_URL:
+                # PostgreSQL optimizations
+                with dbapi_connection.cursor() as cursor:
+                    # Set session-level optimizations
+                    cursor.execute("SET statement_timeout = '30s'")
+                    cursor.execute("SET lock_timeout = '10s'")
+                    cursor.execute("SET idle_in_transaction_session_timeout = '60s'")
+
+        @event.listens_for(cls._engine.sync_engine, "checkout")
+        def log_connection_checkout(
+            dbapi_connection, connection_record, connection_proxy
+        ):
+            """Log connection checkout for monitoring"""
+            logger.debug("Database connection checked out")
+
+        @event.listens_for(cls._engine.sync_engine, "checkin")
+        def log_connection_checkin(dbapi_connection, connection_record):
+            """Log connection checkin for monitoring"""
+            logger.debug("Database connection checked in")
+
+    @classmethod
+    async def get_session(cls) -> AsyncSession:
+        """Get database session from pool"""
+        if cls._sessionmaker is None:
+            await cls.initialize()
+
+        return cls._sessionmaker()
+
+    @classmethod
+    @asynccontextmanager
+    async def get_session_context(cls) -> AsyncGenerator[AsyncSession, None]:
+        """Get database session with automatic cleanup"""
+        session = await cls.get_session()
+        try:
+            yield session
+            await session.commit()
+        except (ValueError, KeyError, RuntimeError, TypeError, AttributeError):
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+    @classmethod
+    async def health_check(cls) -> bool:
+        """Health check for database connectivity"""
+        if cls._engine is None:
+            return False
+
+        try:
+            async with cls.get_session_context() as session:
+                result = await session.execute(text("SELECT 1"))
+                return result.scalar() == 1
+        except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+            logger.error(f"Database health check failed: {str(e)}")
+            return False
+
+    @classmethod
+    async def close(cls):
+        """Close database engine and cleanup connections"""
+        if cls._engine:
+            await cls._engine.dispose()
+            cls._engine = None
+            cls._sessionmaker = None
+            logger.info("Database engine closed")
+
+
+# FastAPI dependency for database sessions
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency to get database session"""
+    async with DatabaseManager.get_session_context() as session:
+        yield session

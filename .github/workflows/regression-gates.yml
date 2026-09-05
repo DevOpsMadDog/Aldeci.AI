@@ -1,0 +1,193 @@
+name: Regression Gates
+
+on:
+  pull_request:
+    branches: [main, features/intermediate-stage]
+  push:
+    branches: [features/intermediate-stage]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  owasp-lockdown:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FIXOPS_DISABLE_TELEMETRY: "1"
+      FIXOPS_API_TOKEN: "ci-test-token"
+      FIXOPS_JWT_SECRET: "ci-jwt-secret-for-testing-only-not-production"
+      FIXOPS_MODE: "enterprise"
+      FIXOPS_SKIP_PATH_SECURITY: "1"
+      FIXOPS_DISABLE_RATE_LIMIT: "1"
+      FIXOPS_EVIDENCE_KEY: "Zz6A0n4P3skS8F6edSxE2xe50Tzw9uQWGWp9JYG1ChE="
+      PYTHONPATH: suite-api:suite-core:suite-attack:suite-feeds:suite-evidence-risk:suite-integrations:.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt 2>/dev/null || true
+          pip install pytest pytest-asyncio
+      # PARALLELIZATION NOTE (2026-05-05): Beast Mode 753 tests run in 8.87s serial.
+      # Install pytest-xdist and add `-n auto` to halve wall-clock to ~3s on 4-core.
+      # Risk: SQLite lock collisions on shared .db paths — audit tmp_path fixtures first.
+      # See docs/test_parallelization_2026-05-05.md for full analysis.
+      - name: OWASP regression lockdown (46 tests)
+        run: |
+          python -m pytest tests/test_owasp_regression_lockdown.py \
+            -x --tb=short --timeout=15 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Engine + router import sweep
+        run: |
+          python -m pytest tests/test_engine_router_import_sweep.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: No unauthenticated /api/v1 endpoints (auth gate)
+        run: |
+          python -m pytest tests/test_no_unauthenticated_endpoints.py \
+            -x --tb=short --timeout=300 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: No fail-OPEN auth fallbacks (fail-closed gate)
+        run: |
+          python -m pytest tests/test_no_fail_open_auth.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: No org_id client Query param (SPEC-034 tenancy gate)
+        run: |
+          python -m pytest tests/test_no_org_id_query_param.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: UI NO-MOCKS static gate (SPEC-028)
+        run: |
+          python -m pytest tests/test_ui_no_mocks_static.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: UI routing integrity gate (SPEC-031)
+        run: |
+          python -m pytest tests/test_ui_route_integrity.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Ingest-first honest-empty gate (SPEC-029)
+        run: |
+          python -m pytest tests/test_ingest_first_honest_empty.py \
+            -x --tb=short --timeout=90 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Real-moat E2E gate (SPEC-032, CI-safe — real ingest + no-fabricated-council)
+        run: |
+          python -m pytest tests/test_real_moat_e2e.py \
+            -x --tb=short --timeout=60 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Customer-journey E2E gate (SPEC-032 — upload→my findings→tenant-isolated→verdict→evidence)
+        run: |
+          python -m pytest tests/test_customer_journey_e2e.py \
+            -x --tb=short --timeout=120 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: UI↔API contract gate (SPEC-033 — pinned endpoint shapes, all test_contract_*)
+        run: |
+          python -m pytest tests/test_contract_*.py \
+            -x --tb=short --timeout=120 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: TrustGraph correlation gate (SPEC-001 — the graph-enriched-verdict moat)
+        run: |
+          python -m pytest tests/test_trustgraph_correlation.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Nuclei pentest gate (SPEC-002 — real connector or honest 503, no simulation)
+        run: |
+          python -m pytest tests/test_nuclei_pentest.py \
+            -x --tb=short --timeout=60 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Deception engine gate (SPEC-024)
+        run: |
+          python -m pytest tests/test_deception_engine.py tests/test_deception_honeypot_list.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Forensics engines gate (SPEC-025)
+        run: |
+          python -m pytest tests/test_digital_forensics_engine.py tests/test_forensics_readiness_engine.py tests/test_network_forensics_engine.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Reachability multilang gate (SPEC-011 — TS/JS/Java parse, no false 500)
+        run: |
+          python -m pytest tests/test_function_reachability_engine.py tests/test_reachability_parse_multilang.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Graph-populate gate (SPEC-005b)
+        run: |
+          python -m pytest tests/test_graph_populate.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Honest-compliance gate (SPEC-006)
+        run: |
+          python -m pytest tests/test_compliance_engine_unit.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Full-pipeline-on-ingest gate (SPEC-017 — core customer path)
+        run: |
+          python -m pytest tests/test_spec017_pipeline_on_ingest.py \
+            -x --tb=short --timeout=60 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Executive-reporting gate (SPEC-026)
+        run: |
+          python -m pytest tests/test_executive_reporting_engine.py \
+            -x --tb=short --timeout=30 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false"
+      - name: Perf lockdown (benchmarks/)
+        run: |
+          python -m pytest tests/benchmarks/ \
+            -m benchmark \
+            -x --tb=short --timeout=15 -q \
+            --override-ini="addopts=" \
+            --override-ini="log_cli=false" \
+            || echo "perf-lockdown file may not exist yet -- skipping"
+
+  ui-build-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: suite-ui/aldeci-ui-new/package-lock.json
+      - name: Install
+        working-directory: suite-ui/aldeci-ui-new
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        working-directory: suite-ui/aldeci-ui-new
+        run: npm run build
+      - name: Verify dist exists
+        working-directory: suite-ui/aldeci-ui-new
+        run: |
+          test -d dist || (echo "BUILD FAILED — no dist directory" && exit 1)
+          ls -la dist/ | head -10

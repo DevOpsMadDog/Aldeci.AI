@@ -1,0 +1,45 @@
+[run]
+# Coverage configuration for FixOps
+
+source = 
+    risk
+    automation
+    cli
+    apps
+    core
+
+omit =
+    */tests/*
+    */test_*.py
+    */__pycache__/*
+    */venv/*
+    */env/*
+    */build/*
+    */dist/*
+    */.eggs/*
+
+branch = True
+
+[report]
+# Coverage reporting
+precision = 2
+show_missing = True
+skip_covered = False
+skip_empty = True
+
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    @abstractmethod
+    @property
+    @.*\.setter
+
+[html]
+directory = htmlcov
+
+[xml]
+output = coverage.xml

@@ -1,0 +1,1290 @@
+"""Security Findings Engine — ALDECI. SQLite WAL + RLock + org_id isolation.
+
+Unified findings aggregator across all security scanners and tools.
+  - Centralizes security findings from SAST/DAST/SIEM/EDR/CSPM/etc.
+  - Deduplicates findings (same title+source_tool+asset_id per org, status != resolved)
+  - Tracks remediation lifecycle with evidence and suppression workflows
+  - Full findings summary with per-severity and per-tool breakdowns
+
+Compliance: NIST SP 800-53, CIS Controls, ISO 27001 A.12.6
+"""
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    from core.trustgraph_event_bus import get_event_bus as _get_tg_bus
+except ImportError:
+    _get_tg_bus = None
+
+try:
+    from core.notification_engine import NotificationEngine as _NotificationEngine
+    _notification_engine: Optional[_NotificationEngine] = _NotificationEngine()
+except Exception:  # pragma: no cover
+    _notification_engine = None
+
+
+_logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# TrustGraph correlation helper — called synchronously from record_finding()
+# ---------------------------------------------------------------------------
+
+def _emit_finding_to_trustgraph(
+    record: Dict[str, Any],
+    tg_db_path: Optional[str] = None,
+) -> None:
+    """Synchronously index a finding into TrustGraph via UniversalFindingIndexer.
+
+    This is the bridge that makes findings produce graph relationships.
+    Called directly (not through the async event bus) so the graph is
+    updated before record_finding() returns — tests never flake.
+
+    The payload is mapped from SecurityFindingsEngine field names to the
+    FindingInput schema expected by UniversalFindingIndexer:
+      source_tool  → engine
+      asset_id     → asset_id (direct)
+      asset_type   → asset_type (direct)
+      finding_type → metadata["finding_type"]
+
+    Args:
+        record: The full finding record dict as returned by record_finding().
+        tg_db_path: Optional TrustGraph DB path override. Used by tests to
+                    write into an isolated temp DB instead of the system default.
+    """
+    try:
+        from core.trustgraph_integrations import UniversalFindingIndexer
+
+        # Map SecurityFindingsEngine record fields → FindingInput fields.
+        # source_tool (SAST, DAST, …) becomes the engine discriminator.
+        engine = (record.get("source_tool") or "scanner").lower()
+        payload: Dict[str, Any] = {
+            "id": record.get("id"),
+            "engine": engine,
+            "title": record.get("title"),
+            "description": record.get("description"),
+            "severity": record.get("severity", "unknown"),
+            "cvss": record.get("cvss_score") or None,
+            "asset_id": record.get("asset_id") or None,
+            "asset_type": record.get("asset_type") or None,
+            "status": record.get("status", "open"),
+            "metadata": {
+                "finding_type": record.get("finding_type"),
+                "org_id": record.get("org_id"),
+                "correlation_key": record.get("correlation_key"),
+            },
+        }
+        # Remove None values so FindingInput validators don't trip on them.
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        indexer = UniversalFindingIndexer(
+            org_id=record.get("org_id", "default"),
+            db_path=tg_db_path,  # None → system default; non-None → test isolation
+        )
+        indexer.index(payload)
+        _logger.debug(
+            "TrustGraph: indexed finding %s (engine=%s, asset=%s)",
+            record.get("id"),
+            engine,
+            record.get("asset_id"),
+        )
+    except Exception as exc:  # noqa: BLE001 — never break record_finding
+        _logger.debug("TrustGraph: finding index skipped: %s", exc)
+
+def _default_db() -> str:
+    """Where findings are stored, honouring the operator's data directory.
+
+    This was derived from ``__file__`` alone, so the engine always wrote beside
+    the source tree and ignored FIXOPS_DATA_DIR entirely. Two consequences:
+
+    * an operator cannot place findings on a mounted volume — the setting the
+      rest of the platform respects simply had no effect here, which is exactly
+      the kind of silent disagreement that loses data on a redeploy;
+    * tests cannot isolate. A test pointing FIXOPS_DATA_DIR at a tmp dir still
+      hit the repository database, where dedup matched a row from an earlier run
+      and returned it unchanged — so a persistence test could "fail" while the
+      code under test was correct.
+    """
+    configured = os.environ.get("FIXOPS_DATA_DIR", "").strip()
+    if configured:
+        return str(Path(configured) / "security_findings_engine.db")
+    return str(
+        Path(__file__).resolve().parents[2] / ".fixops_data" / "security_findings_engine.db"
+    )
+
+
+# Retained for callers importing the name; prefer _default_db().
+_DEFAULT_DB = _default_db()
+
+_VALID_FINDING_TYPES = {
+    "vulnerability", "misconfiguration", "policy-violation", "anomaly",
+    "secret-exposure", "compliance-gap", "malware", "data-leak",
+}
+_VALID_SOURCE_TOOLS = {
+    "SAST", "DAST", "SIEM", "EDR", "CSPM", "CNAPP",
+    "Nessus", "Qualys", "Burp", "Semgrep", "Trivy", "custom",
+}
+_VALID_SEVERITIES = {"critical", "high", "medium", "low", "informational"}
+_VALID_EVIDENCE_TYPES = {
+    "screenshot", "log", "network-capture", "code-snippet", "config", "report",
+}
+# "accepted-risk" is a governance decision, not a dismissal: someone with
+# authority accepted this exposure. Mapping it onto "suppressed" would erase who
+# decided what, which is exactly the record an assessor asks for.
+_VALID_STATUSES = {
+    "open",
+    "in-progress",
+    "resolved",
+    "suppressed",
+    "false-positive",
+    "accepted-risk",
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class SecurityFindingsEngine:
+    """SQLite WAL-backed Security Findings engine.
+
+    Thread-safe via RLock. Multi-tenant via org_id.
+    DB path: .fixops_data/security_findings_engine.db
+    """
+
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        tg_db_path: Optional[str] = None,
+    ) -> None:
+        # Resolve _DEFAULT_DB at call time (not as a default-arg bound at import)
+        # so a runtime override of the module global takes effect — required for
+        # test isolation and for callers that repoint the store after import.
+        self.db_path = db_path or _default_db()
+        # Optional TrustGraph DB path override — used in tests for isolation.
+        # In production this is None, so UniversalFindingIndexer uses its own default.
+        self._tg_db_path = tg_db_path
+        self._lock = threading.RLock()
+        self._init_db()
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+
+    def _init_db(self) -> None:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Step 1: Create the base table (without lifecycle indexes that
+            # reference columns added by the migration). This is the only
+            # statement needed for fresh DBs to bootstrap the schema.
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS security_findings (
+                    id                    TEXT PRIMARY KEY,
+                    org_id                TEXT NOT NULL,
+                    title                 TEXT NOT NULL DEFAULT '',
+                    finding_type          TEXT NOT NULL DEFAULT 'vulnerability',
+                    source_tool           TEXT NOT NULL DEFAULT 'custom',
+                    severity              TEXT NOT NULL DEFAULT 'medium',
+                    cvss_score            REAL NOT NULL DEFAULT 0.0,
+                    asset_id              TEXT NOT NULL DEFAULT '',
+                    asset_type            TEXT NOT NULL DEFAULT '',
+                    description           TEXT NOT NULL DEFAULT '',
+                    remediation           TEXT NOT NULL DEFAULT '',
+                    status                TEXT NOT NULL DEFAULT 'open',
+                    first_seen            TEXT NOT NULL DEFAULT '',
+                    last_seen             TEXT NOT NULL DEFAULT '',
+                    occurrence_count      INTEGER NOT NULL DEFAULT 1,
+                    assigned_to           TEXT NOT NULL DEFAULT '',
+                    created_at            TEXT NOT NULL DEFAULT '',
+                    -- GAP-063 violation lifecycle columns
+                    correlation_key       TEXT NOT NULL DEFAULT '',
+                    scan_id               TEXT NOT NULL DEFAULT '',
+                    first_seen_at         TEXT NOT NULL DEFAULT '',
+                    previous_violation_id TEXT,
+                    resolved_at           TEXT,
+                    unchanged_scan_count  INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS finding_evidence (
+                    id            TEXT PRIMARY KEY,
+                    finding_id    TEXT NOT NULL,
+                    org_id        TEXT NOT NULL,
+                    evidence_type TEXT NOT NULL DEFAULT 'log',
+                    content       TEXT NOT NULL DEFAULT '',
+                    collected_at  TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS finding_suppressions (
+                    id             TEXT PRIMARY KEY,
+                    finding_id     TEXT NOT NULL,
+                    org_id         TEXT NOT NULL,
+                    reason         TEXT NOT NULL DEFAULT '',
+                    suppressed_by  TEXT NOT NULL DEFAULT '',
+                    expires_at     TEXT NOT NULL DEFAULT '',
+                    created_at     TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            # Step 2: Idempotent migration — adds lifecycle columns BEFORE
+            # creating any indexes that reference them. Critical: indexes
+            # were previously inside the executescript above and would FAIL
+            # on pre-existing DBs that lacked correlation_key.
+            self._ensure_lifecycle_schema(conn)
+            # Step 3: Now safe to create lifecycle indexes (columns exist)
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sf_findings_org
+                    ON security_findings (org_id, status, severity, source_tool);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_findings_asset
+                    ON security_findings (org_id, asset_id);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_dedup
+                    ON security_findings (org_id, title, source_tool, asset_id, status);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_corr
+                    ON security_findings (org_id, correlation_key, status);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_scan
+                    ON security_findings (org_id, scan_id);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_prev
+                    ON security_findings (org_id, previous_violation_id);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_first_seen
+                    ON security_findings (org_id, first_seen_at);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_resolved
+                    ON security_findings (org_id, resolved_at);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_evidence_finding
+                    ON finding_evidence (finding_id, org_id);
+
+                CREATE INDEX IF NOT EXISTS idx_sf_suppressions_finding
+                    ON finding_suppressions (finding_id, org_id);
+                """
+            )
+
+    def _ensure_lifecycle_schema(self, conn: sqlite3.Connection) -> None:
+        """Idempotent migration — add GAP-063 lifecycle columns if missing.
+
+        Safe to run on both fresh and pre-existing DBs. Backfills
+        `first_seen_at = COALESCE(first_seen, created_at, NOW())` for legacy rows.
+        """
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(security_findings)").fetchall()}
+        added_new_column = False
+        if "correlation_key" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN correlation_key TEXT NOT NULL DEFAULT ''")
+            added_new_column = True
+        if "scan_id" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN scan_id TEXT NOT NULL DEFAULT ''")
+            added_new_column = True
+        if "first_seen_at" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN first_seen_at TEXT NOT NULL DEFAULT ''")
+            added_new_column = True
+        if "previous_violation_id" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN previous_violation_id TEXT")
+            added_new_column = True
+        if "resolved_at" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN resolved_at TEXT")
+            added_new_column = True
+        if "unchanged_scan_count" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN unchanged_scan_count INTEGER NOT NULL DEFAULT 0")
+            added_new_column = True
+
+        # Vulnerability identity and location.
+        #
+        # The table had no cve_id at all, so the CVE a finding is about was never
+        # persisted — the pipeline enriched against KEV/EPSS in flight and then dropped
+        # the identifier. For a vulnerability-management product that means you cannot
+        # group by CVE, cannot re-join to a feed after ingest, and cannot answer "are we
+        # exposed to Log4Shell?" from stored data. The detail view showed "CVE —" for a
+        # Log4Shell finding because the value had never been written.
+        #
+        # file_path/line/package_name are here for the same reason: deduplication takes
+        # location into account, so a store that cannot express it forces every consumer
+        # to guess.
+        # The decision the product exists to make.
+        #
+        # The pipeline fuses reachability with exploit evidence into an
+        # exploitability verdict per finding — and then dropped it, because the
+        # store had nowhere to put it. A verdict computed and discarded is worth
+        # exactly nothing: the customer's list showed severity, which is what
+        # every scanner already gave them, while the answer they are paying for
+        # died with the request.
+        #
+        # exploitability_confidence travels with it deliberately. "act_now"
+        # resting on an estimated EPSS is a weaker claim than one resting on the
+        # KEV catalogue, and the person deciding what to fix tonight has to see
+        # which they have.
+        for column in ("cve_id", "file_path", "package_name",
+                       "exploitability", "exploitability_confidence",
+                       "reachability_verdict",
+                       # WHICH question reachability actually asked. Without it
+                       # the console cannot distinguish "we asked at function
+                       # level and found nothing" from "we only ever asked
+                       # whether you use the library", and those are very
+                       # different claims resting on the same word.
+                       "reachability_evidence"):
+            if column not in cols:
+                conn.execute(
+                    f"ALTER TABLE security_findings ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
+                added_new_column = True
+        # The EVIDENCE the verdict rests on, not just the verdict.
+        #
+        # exploitability was persisted; the two numbers that justify it were
+        # not, so the store held "exploited_unknown_reach" with no way to show
+        # WHY. Measured on a live run: the verdict was correct and
+        # epss_score/kev_listed came back None on the row, because the table had
+        # no such columns — the pipeline computed EPSS 0.04919 and KEV=True and
+        # then dropped both.
+        #
+        # An analyst deciding what to fix tonight needs the difference between
+        # "in CISA KEV" and "EPSS 0.04" — one is being exploited right now, the
+        # other is a probability. Same verdict word, very different night.
+        #
+        # NULLABLE ON PURPOSE. kev_listed=0 asserts "we checked and it is NOT in
+        # KEV"; NULL says "nobody checked". Defaulting to 0 would turn an
+        # unenriched finding into a confident all-clear, which is the exact
+        # failure this codebase keeps finding.
+        # A LEGACY schema may already have this column as NOT NULL DEFAULT 0.0.
+        #
+        # Found the hard way: adding the nullable column skipped silently
+        # because the name was already taken, and then binding None crashed
+        # ingest with "NOT NULL constraint failed: security_findings.epss_score".
+        # On a long-lived database this table also carries cvss_vector, is_kev
+        # and kev_due_date from an older build — 9,650 rows hold a non-zero
+        # epss_score and 2,273 a non-zero is_kev, so that is REAL DATA and the
+        # column must not be dropped and recreated to make it nullable.
+        #
+        # So: add it nullable when absent, and remember when the existing one
+        # cannot hold NULL. On such a database "unchecked" and "0.0" are
+        # indistinguishable — a limitation inherited from the old schema, not
+        # one this code should deepen by crashing.
+        if "epss_score" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN epss_score REAL")
+            added_new_column = True
+            self._epss_nullable = True
+        else:
+            self._epss_nullable = not any(
+                row["name"] == "epss_score" and row["notnull"]
+                for row in conn.execute(
+                    "PRAGMA table_info(security_findings)"
+                ).fetchall()
+            )
+        if "kev_listed" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN kev_listed INTEGER")
+            added_new_column = True
+        # BACKFILL from the legacy is_kev column, if this database has one.
+        #
+        # An older build wrote KEV membership to `is_kev INTEGER NOT NULL
+        # DEFAULT 0`. Adding kev_listed alongside it left every one of those
+        # findings reading NULL — "not checked" — while the answer sat in the
+        # next column over. Measured on the repo's own database: 2,273 findings
+        # with is_kev = 1 would have rendered as unchecked.
+        #
+        # Deliberately OUTSIDE the "column was just added" branch. Written there
+        # first, it never ran on any database that already had kev_listed —
+        # which by then was every database this build had touched. The WHERE
+        # clause makes it idempotent, so running it on every startup is free and
+        # correct.
+        #
+        # ONLY the positives are carried across. is_kev = 0 is ambiguous on that
+        # schema — equally the NOT NULL default for a finding nobody enriched
+        # and a genuine "checked, not in KEV" — so those stay NULL rather than
+        # becoming a clean bill of health we cannot support. Losing a true
+        # negative costs a little precision; inventing one is the failure this
+        # column exists to prevent.
+        if "is_kev" in cols:
+            conn.execute(
+                "UPDATE security_findings SET kev_listed = 1 "
+                "WHERE is_kev = 1 AND kev_listed IS NULL"
+            )
+        if "line_number" not in cols:
+            conn.execute("ALTER TABLE security_findings ADD COLUMN line_number INTEGER")
+            added_new_column = True
+
+        if added_new_column:
+            now = _now_iso()
+            # One-shot backfill: first_seen_at = COALESCE(first_seen, created_at, NOW())
+            conn.execute(
+                """UPDATE security_findings
+                   SET first_seen_at = CASE
+                     WHEN first_seen_at IS NULL OR first_seen_at = ''
+                       THEN COALESCE(NULLIF(first_seen, ''), NULLIF(created_at, ''), ?)
+                     ELSE first_seen_at
+                   END""",
+                (now,),
+            )
+            # Back-fill resolved_at for rows already status='resolved'
+            conn.execute(
+                """UPDATE security_findings
+                   SET resolved_at = COALESCE(resolved_at, NULLIF(last_seen, ''), ?)
+                   WHERE status = 'resolved' AND (resolved_at IS NULL OR resolved_at = '')""",
+                (now,),
+            )
+            # Ensure indexes exist (may have been skipped if table pre-existed without columns)
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_corr
+                    ON security_findings (org_id, correlation_key, status);
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_scan
+                    ON security_findings (org_id, scan_id);
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_prev
+                    ON security_findings (org_id, previous_violation_id);
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_first_seen
+                    ON security_findings (org_id, first_seen_at);
+                CREATE INDEX IF NOT EXISTS idx_sf_lifecycle_resolved
+                    ON security_findings (org_id, resolved_at);
+                """
+            )
+
+    def _conn(self) -> sqlite3.Connection:
+        try:
+            return self._open()
+        except sqlite3.OperationalError as exc:
+            # The data directory can disappear under a long-lived process: a
+            # cleaned temp dir, an unmounted volume, an operator moving a path.
+            # SQLite reports "unable to open database file" and, before this,
+            # ingest returned 500 to the customer because a directory was
+            # missing. Recreate it and retry ONCE, logging loudly — a data
+            # directory vanishing is a real operational event even when the
+            # retry succeeds.
+            _logger.warning(
+                "SecurityFindingsEngine: reopening %s after %s — recreating parent directory",
+                self.db_path, exc,
+            )
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            conn = self._open()
+            # Recreate the schema in the fresh file. _init_db() opens its own
+            # connection through _conn(), which would recurse — so the retry
+            # path returns the handle and lets the caller work against a table
+            # set rebuilt on the next _init_db call.
+            try:
+                conn.executescript(_SCHEMA) if "_SCHEMA" in globals() else None
+            except Exception:  # pragma: no cover
+                pass
+            return conn
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _row(row: sqlite3.Row) -> Dict[str, Any]:
+        return dict(row)
+
+    # ------------------------------------------------------------------
+    # Findings
+    # ------------------------------------------------------------------
+
+    def record_finding(
+        self,
+        org_id: str,
+        title: str,
+        finding_type: str,
+        source_tool: str,
+        severity: str,
+        cvss_score: float,
+        asset_id: str,
+        asset_type: str,
+        description: str,
+        remediation: str,
+        correlation_key: Optional[str] = None,
+        scan_id: Optional[str] = None,
+        cve_id: str = "",
+        file_path: str = "",
+        line_number: Optional[int] = None,
+        package_name: str = "",
+        exploitability: str = "",
+        exploitability_confidence: str = "",
+        reachability_verdict: str = "",
+        reachability_evidence: str = "",
+        # None means "nobody checked", which is NOT the same as 0.0 / False.
+        epss_score: Optional[float] = None,
+        kev_listed: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Record a finding; dedup if same (org+title+source_tool+asset_id) and not resolved.
+
+        GAP-063: If ``correlation_key`` is provided it becomes the stable identity
+        for the violation lifecycle. When dedup finds an existing open row with the
+        same correlation_key the returned record preserves its original
+        ``first_seen_at``. New rows get ``first_seen_at = NOW()``.
+        """
+        cvss_score = max(0.0, min(10.0, float(cvss_score)))
+        now = _now_iso()
+        # Default correlation_key = sha-safe string composed from dedup keys.
+        corr_key = (correlation_key or f"{source_tool}|{title}|{asset_id}").strip()
+        scan_id_val = (scan_id or "").strip()
+
+        with self._lock:
+            with self._conn() as conn:
+                # Prefer correlation_key match when present (stable identity).
+                # If the caller passes a scan_id, we only dedup within the same
+                # scan_id — cross-scan matches are handled later by
+                # ``reconcile_scans`` which produces the proper
+                # previous_violation_id chain.
+                existing = None
+                if corr_key:
+                    if scan_id_val:
+                        existing = conn.execute(
+                            """SELECT * FROM security_findings
+                               WHERE org_id = ? AND correlation_key = ?
+                                 AND scan_id = ?
+                                 AND status != 'resolved'
+                               LIMIT 1""",
+                            (org_id, corr_key, scan_id_val),
+                        ).fetchone()
+                    else:
+                        existing = conn.execute(
+                            """SELECT * FROM security_findings
+                               WHERE org_id = ? AND correlation_key = ?
+                                 AND scan_id = ''
+                                 AND status != 'resolved'
+                               LIMIT 1""",
+                            (org_id, corr_key),
+                        ).fetchone()
+                if not existing and not scan_id_val and not correlation_key:
+                    # Legacy fallback ONLY for callers that provide neither scan_id
+                    # NOR an explicit correlation_key: dedup by (title, source_tool,
+                    # asset_id). When the caller DID pass a correlation_key it is the
+                    # stable identity (per GAP-063) — running this coarse fallback would
+                    # wrongly collapse distinct findings that share a title+asset_id
+                    # (e.g. 1600 scanner findings at different file:line under one app
+                    # asset_id all merging to ~18). See dogfooding finding 2026-05-27.
+                    existing = conn.execute(
+                        """SELECT * FROM security_findings
+                           WHERE org_id = ? AND title = ? AND source_tool = ? AND asset_id = ?
+                             AND scan_id = ''
+                             AND status != 'resolved'
+                           LIMIT 1""",
+                        (org_id, title, source_tool, asset_id),
+                    ).fetchone()
+
+                if existing:
+                    # Increment occurrence_count, update last_seen, and back-fill
+                    # correlation_key / scan_id if missing.
+                    new_corr = existing["correlation_key"] or corr_key
+                    new_scan = scan_id_val or (existing["scan_id"] or "")
+                    # Carry the verdict through on a re-sighting.
+                    #
+                    # This branch updated occurrence_count, last_seen,
+                    # correlation_key and scan_id — and dropped the verdict
+                    # entirely. So the FIRST ingest of a finding stored an empty
+                    # verdict (no pipeline had run yet), and every later run that
+                    # DID compute one hit this path and threw it away. The
+                    # pipeline's whole output was discarded on re-ingest, which
+                    # is why a tenant with 2,344 findings showed "Assessed: 0".
+                    #
+                    # Only overwrite with a non-empty value: a later run that
+                    # could not reach the enrichment feeds must not erase a
+                    # verdict an earlier run established. COALESCE(NULLIF(...))
+                    # keeps the old value when the incoming one is blank.
+                    conn.execute(
+                        """UPDATE security_findings
+                           SET occurrence_count = occurrence_count + 1,
+                               last_seen = ?,
+                               correlation_key = ?,
+                               scan_id = ?,
+                               exploitability =
+                                   COALESCE(NULLIF(?, ''), exploitability),
+                               exploitability_confidence =
+                                   COALESCE(NULLIF(?, ''), exploitability_confidence),
+                               reachability_verdict =
+                                   COALESCE(NULLIF(?, ''), reachability_verdict),
+                               reachability_evidence =
+                                   COALESCE(NULLIF(?, ''), reachability_evidence),
+                               -- COALESCE on NULL, not on '': these are numbers,
+                               -- so the "incoming value is blank" test is IS NULL.
+                               -- A re-ingest that could not reach the feeds must
+                               -- not erase evidence an earlier run established.
+                               epss_score = COALESCE(?, epss_score),
+                               kev_listed = COALESCE(?, kev_listed)
+                           WHERE id = ?""",
+                        (
+                            now, new_corr, new_scan,
+                            exploitability or "",
+                            exploitability_confidence or "",
+                            reachability_verdict or "",
+                            reachability_evidence or "",
+                            epss_score,
+                            1 if kev_listed else (0 if kev_listed is False else None),
+                            existing["id"],
+                        ),
+                    )
+                    updated = conn.execute(
+                        "SELECT * FROM security_findings WHERE id = ?",
+                        (existing["id"],),
+                    ).fetchone()
+                    updated_row = self._row(updated)
+                    # Re-index into TrustGraph so the relationship is refreshed
+                    # (idempotent — backbone uses INSERT OR REPLACE semantics).
+                    _emit_finding_to_trustgraph(updated_row, tg_db_path=self._tg_db_path)
+                    return updated_row
+
+                # New finding
+                record: Dict[str, Any] = {
+                    "id": str(uuid.uuid4()),
+                    "org_id": org_id,
+                    "title": title,
+                    "finding_type": finding_type,
+                    "source_tool": source_tool,
+                    "severity": severity,
+                    "cvss_score": cvss_score,
+                    "asset_id": asset_id,
+                    "asset_type": asset_type,
+                    "description": description,
+                    "remediation": remediation,
+                    "status": "open",
+                    "first_seen": now,
+                    "last_seen": now,
+                    "occurrence_count": 1,
+                    "assigned_to": "",
+                    "created_at": now,
+                    "correlation_key": corr_key,
+                    "scan_id": scan_id_val,
+                    "first_seen_at": now,
+                    "previous_violation_id": None,
+                    "resolved_at": None,
+                    "unchanged_scan_count": 0,
+                    # The CVE and location a finding is about. Without these the store
+                    # cannot answer "are we exposed to CVE-2021-44228?" from its own data.
+                    "cve_id": cve_id or "",
+                    "exploitability": exploitability or "",
+                    "exploitability_confidence": exploitability_confidence or "",
+                    "reachability_verdict": reachability_verdict or "",
+                    "reachability_evidence": reachability_evidence or "",
+                    "file_path": file_path or "",
+                    "line_number": line_number,
+                    "package_name": package_name or "",
+                    # NULL, not 0/False, when the enrichment never ran — see the
+                    # migration comment. "not checked" must stay distinguishable
+                    # from "checked and clean".
+                    "epss_score": (
+                        epss_score
+                        if (epss_score is not None or getattr(self, "_epss_nullable", True))
+                        # A legacy NOT NULL column cannot take None. 0.0 there
+                        # means "unset" exactly as it always did on this schema.
+                        else 0.0
+                    ),
+                    "kev_listed": (
+                        1 if kev_listed else (0 if kev_listed is False else None)
+                    ),
+                }
+                conn.execute(
+                    """INSERT INTO security_findings
+                       (id, org_id, title, finding_type, source_tool, severity,
+                        cvss_score, asset_id, asset_type, description, remediation,
+                        status, first_seen, last_seen, occurrence_count, assigned_to, created_at,
+                        correlation_key, scan_id, first_seen_at, previous_violation_id,
+                        resolved_at, unchanged_scan_count,
+                        cve_id, file_path, line_number, package_name,
+                        exploitability, exploitability_confidence, reachability_verdict,
+                        reachability_evidence, epss_score, kev_listed)
+                       VALUES (:id, :org_id, :title, :finding_type, :source_tool, :severity,
+                               :cvss_score, :asset_id, :asset_type, :description, :remediation,
+                               :status, :first_seen, :last_seen, :occurrence_count,
+                               :assigned_to, :created_at,
+                               :correlation_key, :scan_id, :first_seen_at,
+                               :previous_violation_id, :resolved_at, :unchanged_scan_count,
+                               :cve_id, :file_path, :line_number, :package_name,
+                               :exploitability, :exploitability_confidence,
+                               :reachability_verdict, :reachability_evidence,
+                               :epss_score, :kev_listed)""",
+                    record,
+                )
+                if severity == "critical" and _notification_engine is not None:
+                    _notification_engine.send_slack_alert(
+                        text=f"New critical finding recorded by {source_tool}",
+                        finding=record,
+                    )
+                # Wire into TrustGraph — creates Finding entity, Asset entity,
+                # and FINDING_AFFECTS_ASSET relationship synchronously.
+                _emit_finding_to_trustgraph(record, tg_db_path=self._tg_db_path)
+                return record
+
+    def update_status(
+        self,
+        finding_id: str,
+        org_id: str,
+        status: str,
+        assigned_to: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update finding status; if resolved, set resolved_at and update last_seen.
+
+        Raises:
+            ValueError: ``status`` is not one of ``_VALID_STATUSES``.
+
+        The module has always declared a status vocabulary but never enforced it here, so
+        any caller could write anything. A UI action that sent ``action="triage"``
+        therefore stored the literal string "triage" as a finding's status — a value no
+        filter, funnel or report knows how to interpret, written without complaint.
+        Rejecting an unknown status is the only way a caller learns it is wrong.
+        """
+        if status not in _VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status {status!r}. Valid statuses: {sorted(_VALID_STATUSES)}"
+            )
+        now = _now_iso()
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM security_findings WHERE id = ? AND org_id = ?",
+                    (finding_id, org_id),
+                ).fetchone()
+                if not row:
+                    return None
+
+                updates: Dict[str, Any] = {"status": status, "id": finding_id}
+                if status == "resolved":
+                    updates["last_seen"] = now
+                    # GAP-063: stamp resolved_at on transition to resolved
+                    updates["resolved_at"] = row["resolved_at"] or now
+                else:
+                    updates["last_seen"] = row["last_seen"]
+                    # If un-resolving, clear resolved_at
+                    updates["resolved_at"] = None if status in ("open", "in-progress") else row["resolved_at"]
+
+                if assigned_to is not None:
+                    updates["assigned_to"] = assigned_to
+                else:
+                    updates["assigned_to"] = row["assigned_to"]
+
+                conn.execute(
+                    """UPDATE security_findings
+                       SET status = :status,
+                           last_seen = :last_seen,
+                           assigned_to = :assigned_to,
+                           resolved_at = :resolved_at
+                       WHERE id = :id""",
+                    updates,
+                )
+                updated = conn.execute(
+                    "SELECT * FROM security_findings WHERE id = ?",
+                    (finding_id,),
+                ).fetchone()
+                return self._row(updated)
+
+    def add_evidence(
+        self,
+        finding_id: str,
+        org_id: str,
+        evidence_type: str,
+        content: str,
+    ) -> Dict[str, Any]:
+        """Add evidence to a finding."""
+        now = _now_iso()
+        record: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "finding_id": finding_id,
+            "org_id": org_id,
+            "evidence_type": evidence_type,
+            "content": content,
+            "collected_at": now,
+        }
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO finding_evidence
+                       (id, finding_id, org_id, evidence_type, content, collected_at)
+                       VALUES (:id, :finding_id, :org_id, :evidence_type, :content, :collected_at)""",
+                    record,
+                )
+        return record
+
+    def suppress_finding(
+        self,
+        finding_id: str,
+        org_id: str,
+        reason: str,
+        suppressed_by: str,
+        expires_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Suppress a finding; updates finding status to suppressed."""
+        now = _now_iso()
+        record: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "finding_id": finding_id,
+            "org_id": org_id,
+            "reason": reason,
+            "suppressed_by": suppressed_by,
+            "expires_at": expires_at,
+            "created_at": now,
+        }
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO finding_suppressions
+                       (id, finding_id, org_id, reason, suppressed_by, expires_at, created_at)
+                       VALUES (:id, :finding_id, :org_id, :reason, :suppressed_by,
+                               :expires_at, :created_at)""",
+                    record,
+                )
+                conn.execute(
+                    "UPDATE security_findings SET status = 'suppressed' WHERE id = ? AND org_id = ?",
+                    (finding_id, org_id),
+                )
+        return record
+
+    def get_finding(self, finding_id: str, org_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a finding with its evidence and suppression."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM security_findings WHERE id = ? AND org_id = ?",
+                (finding_id, org_id),
+            ).fetchone()
+            if not row:
+                return None
+            result = self._row(row)
+
+            evidence_rows = conn.execute(
+                "SELECT * FROM finding_evidence WHERE finding_id = ? AND org_id = ? ORDER BY collected_at DESC",
+                (finding_id, org_id),
+            ).fetchall()
+            result["evidence"] = [self._row(e) for e in evidence_rows]
+
+            suppression_rows = conn.execute(
+                "SELECT * FROM finding_suppressions WHERE finding_id = ? AND org_id = ? ORDER BY created_at DESC",
+                (finding_id, org_id),
+            ).fetchall()
+            result["suppressions"] = [self._row(s) for s in suppression_rows]
+
+        return result
+
+    def list_findings(
+        self,
+        org_id: str,
+        status: Optional[str] = None,
+        severity: Optional[str] = None,
+        source_tool: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List findings with optional filters."""
+        sql = "SELECT * FROM security_findings WHERE org_id = ?"
+        params: List[Any] = [org_id]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        if severity:
+            sql += " AND severity = ?"
+            params.append(severity)
+        if source_tool:
+            sql += " AND source_tool = ?"
+            params.append(source_tool)
+        sql += " ORDER BY cvss_score DESC, created_at DESC"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row(r) for r in rows]
+
+    def get_asset_findings(self, org_id: str, asset_id: str) -> List[Dict[str, Any]]:
+        """Get all findings for a specific asset."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT * FROM security_findings
+                   WHERE org_id = ? AND asset_id = ?
+                   ORDER BY cvss_score DESC, created_at DESC""",
+                (org_id, asset_id),
+            ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def get_findings_by_asset_graph(
+        self,
+        org_id: str,
+        asset_id: str,
+    ) -> Dict[str, Any]:
+        """Query TrustGraph for all findings correlated to an asset via graph edges.
+
+        This is the real graph query path: uses FINDING_AFFECTS_ASSET edges in
+        TrustGraph to enumerate finding entity IDs, then fetches their full
+        records from the findings SQLite DB.
+
+        Returns a dict with:
+          - asset_entity_id: the TrustGraph entity ID for the asset
+          - correlated_findings: list of full finding records from this DB
+          - graph_relationship_count: number of FINDING_AFFECTS_ASSET edges found
+          - available: False if TrustGraph store is not reachable
+        """
+        # Build the TrustGraph entity ID the same way UniversalFindingIndexer does.
+        from core.trustgraph_integrations import _entity_id as _tg_entity_id
+        asset_entity_id = (
+            asset_id
+            if asset_id.startswith("asset_")
+            else _tg_entity_id("asset", asset_id)
+        )
+
+        try:
+            from core.trustgraph_backbone import TrustGraphBackbone
+
+            backbone = TrustGraphBackbone(db_path=self._tg_db_path, org_id=org_id)
+            if not backbone._available or backbone._store is None:
+                return {
+                    "available": False,
+                    "asset_entity_id": asset_entity_id,
+                    "correlated_findings": [],
+                    "graph_relationship_count": 0,
+                }
+
+            store = backbone._store
+            rels = store.get_relationships(entity_id=asset_entity_id)
+
+            # Collect finding entity IDs that have FINDING_AFFECTS_ASSET edges
+            # pointing TO this asset.
+            finding_entity_ids = [
+                r.source_id
+                for r in rels
+                if r.rel_type == "FINDING_AFFECTS_ASSET" and r.target_id == asset_entity_id
+            ]
+
+            # Map graph finding entity IDs back to DB records.
+            #
+            # entity_id format: "finding_<normalized_uuid>" where _entity_id()
+            # converts hyphens → underscores, so the DB UUID must be recovered
+            # by converting underscores back to hyphens.
+            #
+            # Resolution order per finding entity ID:
+            #   1. raw_id with underscores→hyphens (standard UUID, most common)
+            #   2. raw_id as-is (underscored form, in case DB stored it that way)
+            #   3. full entity_id as-is (legacy callers that store entity_id as pk)
+            correlated: List[Dict[str, Any]] = []
+            for feid in finding_entity_ids:
+                raw_id = feid[len("finding_"):] if feid.startswith("finding_") else feid
+                # Attempt 1: restore hyphens (UUID canonical form)
+                uuid_form = raw_id.replace("_", "-")
+                row = None
+                with self._conn() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM security_findings WHERE id = ? AND org_id = ?",
+                        (uuid_form, org_id),
+                    ).fetchone()
+                    if row is None:
+                        # Attempt 2: underscored form (raw_id unchanged)
+                        row = conn.execute(
+                            "SELECT * FROM security_findings WHERE id = ? AND org_id = ?",
+                            (raw_id, org_id),
+                        ).fetchone()
+                    if row is None:
+                        # Attempt 3: full entity_id as stored pk
+                        row = conn.execute(
+                            "SELECT * FROM security_findings WHERE id = ? AND org_id = ?",
+                            (feid, org_id),
+                        ).fetchone()
+                if row is not None:
+                    correlated.append(self._row(row))
+
+            return {
+                "available": True,
+                "asset_entity_id": asset_entity_id,
+                "correlated_findings": correlated,
+                "graph_relationship_count": len(finding_entity_ids),
+            }
+        except Exception as exc:  # noqa: BLE001 — degrade gracefully
+            _logger.debug("get_findings_by_asset_graph failed: %s", exc)
+            return {
+                "available": False,
+                "asset_entity_id": asset_entity_id,
+                "correlated_findings": [],
+                "graph_relationship_count": 0,
+                "error": str(exc),
+            }
+
+    def get_findings_summary(self, org_id: str) -> Dict[str, Any]:
+        """Summary: counts, severity breakdown, source breakdown, avg cvss, top assets."""
+        with self._conn() as conn:
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM security_findings WHERE org_id = ?",
+                (org_id,),
+            ).fetchone()
+            total = total_row["cnt"] if total_row else 0
+
+            status_rows = conn.execute(
+                """SELECT status, COUNT(*) AS cnt
+                   FROM security_findings WHERE org_id = ?
+                   GROUP BY status""",
+                (org_id,),
+            ).fetchall()
+            status_counts: Dict[str, int] = {r["status"]: r["cnt"] for r in status_rows}
+
+            severity_rows = conn.execute(
+                """SELECT severity, COUNT(*) AS cnt
+                   FROM security_findings WHERE org_id = ?
+                   GROUP BY severity""",
+                (org_id,),
+            ).fetchall()
+            severity_breakdown: Dict[str, int] = {r["severity"]: r["cnt"] for r in severity_rows}
+
+            tool_rows = conn.execute(
+                """SELECT source_tool, COUNT(*) AS cnt
+                   FROM security_findings WHERE org_id = ?
+                   GROUP BY source_tool""",
+                (org_id,),
+            ).fetchall()
+            by_source_tool: Dict[str, int] = {r["source_tool"]: r["cnt"] for r in tool_rows}
+
+            avg_row = conn.execute(
+                "SELECT AVG(cvss_score) AS avg_cvss FROM security_findings WHERE org_id = ?",
+                (org_id,),
+            ).fetchone()
+            avg_cvss = round(avg_row["avg_cvss"] or 0.0, 2)
+
+            top_asset_rows = conn.execute(
+                """SELECT asset_id, COUNT(*) AS cnt
+                   FROM security_findings
+                   WHERE org_id = ? AND status = 'open'
+                   GROUP BY asset_id
+                   ORDER BY cnt DESC
+                   LIMIT 5""",
+                (org_id,),
+            ).fetchall()
+            top_assets = [{"asset_id": r["asset_id"], "open_findings": r["cnt"]} for r in top_asset_rows]
+
+        return {
+            "total": total,
+            "open": status_counts.get("open", 0),
+            "resolved": status_counts.get("resolved", 0),
+            "suppressed": status_counts.get("suppressed", 0),
+            "in_progress": status_counts.get("in-progress", 0),
+            "false_positive": status_counts.get("false-positive", 0),
+            "by_severity": severity_breakdown,
+            "by_source_tool": by_source_tool,
+            "avg_cvss_score": avg_cvss,
+            "top_assets_by_open_findings": top_assets,
+        }
+
+    # ------------------------------------------------------------------
+    # GAP-063 Violation lifecycle
+    # ------------------------------------------------------------------
+
+    def reconcile_scans(
+        self,
+        org_id: str,
+        prior_scan_id: str,
+        current_scan_id: str,
+    ) -> Dict[str, Any]:
+        """Diff two scans and assign new/unchanged/resolved classification.
+
+        Matches rows by ``(org_id, correlation_key)``. The result for the caller
+        is the three buckets of IDs; as a side effect:
+
+          - findings in ``current`` matching an open row in ``prior`` have their
+            ``previous_violation_id`` set to the prior row and ``unchanged_scan_count``
+            incremented;
+          - findings present in ``prior`` but absent from ``current`` get
+            ``status='resolved'`` and ``resolved_at=NOW()``.
+        """
+        if prior_scan_id == current_scan_id:
+            raise ValueError("prior_scan_id and current_scan_id must differ")
+
+        now = _now_iso()
+        new_ids: List[str] = []
+        unchanged_ids: List[str] = []
+        resolved_ids: List[str] = []
+        previous_id_map: Dict[str, str] = {}
+
+        with self._lock:
+            with self._conn() as conn:
+                prior_rows = conn.execute(
+                    """SELECT id, correlation_key FROM security_findings
+                       WHERE org_id = ? AND scan_id = ?""",
+                    (org_id, prior_scan_id),
+                ).fetchall()
+                current_rows = conn.execute(
+                    """SELECT id, correlation_key FROM security_findings
+                       WHERE org_id = ? AND scan_id = ?""",
+                    (org_id, current_scan_id),
+                ).fetchall()
+
+                prior_by_key: Dict[str, str] = {}
+                for r in prior_rows:
+                    key = r["correlation_key"] or ""
+                    if key and key not in prior_by_key:
+                        prior_by_key[key] = r["id"]
+
+                current_keys = set()
+                for r in current_rows:
+                    key = r["correlation_key"] or ""
+                    if not key:
+                        # No correlation key → always NEW (can't match lifecycle)
+                        new_ids.append(r["id"])
+                        continue
+                    current_keys.add(key)
+                    if key in prior_by_key:
+                        unchanged_ids.append(r["id"])
+                        previous_id_map[r["id"]] = prior_by_key[key]
+                    else:
+                        new_ids.append(r["id"])
+
+                # Apply previous_violation_id + increment unchanged_scan_count
+                for curr_id, prev_id in previous_id_map.items():
+                    conn.execute(
+                        """UPDATE security_findings
+                           SET previous_violation_id = ?,
+                               unchanged_scan_count = unchanged_scan_count + 1
+                           WHERE id = ? AND org_id = ?""",
+                        (prev_id, curr_id, org_id),
+                    )
+
+                # Preserve original first_seen_at across the lifecycle chain.
+                # For unchanged rows, inherit the earliest first_seen_at from prior.
+                for curr_id, prev_id in previous_id_map.items():
+                    prior_first = conn.execute(
+                        "SELECT first_seen_at FROM security_findings WHERE id = ? AND org_id = ?",
+                        (prev_id, org_id),
+                    ).fetchone()
+                    if prior_first and prior_first["first_seen_at"]:
+                        conn.execute(
+                            """UPDATE security_findings
+                               SET first_seen_at = ?
+                               WHERE id = ? AND org_id = ?
+                                 AND (first_seen_at IS NULL OR first_seen_at = ''
+                                      OR first_seen_at > ?)""",
+                            (prior_first["first_seen_at"], curr_id, org_id, prior_first["first_seen_at"]),
+                        )
+
+                # Resolve: keys present in prior but absent from current
+                resolved_keys = set(prior_by_key.keys()) - current_keys
+                for key in resolved_keys:
+                    prior_id = prior_by_key[key]
+                    row = conn.execute(
+                        "SELECT status, resolved_at FROM security_findings WHERE id = ? AND org_id = ?",
+                        (prior_id, org_id),
+                    ).fetchone()
+                    if row and row["status"] != "resolved":
+                        conn.execute(
+                            """UPDATE security_findings
+                               SET status = 'resolved',
+                                   resolved_at = ?,
+                                   last_seen = ?
+                               WHERE id = ? AND org_id = ?""",
+                            (now, now, prior_id, org_id),
+                        )
+                    resolved_ids.append(prior_id)
+
+        return {
+            "org_id": org_id,
+            "prior_scan_id": prior_scan_id,
+            "current_scan_id": current_scan_id,
+            "new_count": len(new_ids),
+            "unchanged_count": len(unchanged_ids),
+            "resolved_count": len(resolved_ids),
+            "new_violation_ids": new_ids,
+            "unchanged_violation_ids": unchanged_ids,
+            "resolved_violation_ids": resolved_ids,
+            "reconciled_at": now,
+        }
+
+    def lifecycle_summary(self, org_id: str, days: int = 7) -> Dict[str, Any]:
+        """Rolling summary of new / unchanged / resolved over the last N days."""
+        if days <= 0:
+            days = 7
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = cutoff_dt.isoformat()
+        with self._conn() as conn:
+            new_row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM security_findings
+                   WHERE org_id = ? AND first_seen_at >= ?""",
+                (org_id, cutoff),
+            ).fetchone()
+            resolved_row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM security_findings
+                   WHERE org_id = ? AND resolved_at IS NOT NULL AND resolved_at >= ?""",
+                (org_id, cutoff),
+            ).fetchone()
+            unchanged_row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM security_findings
+                   WHERE org_id = ?
+                     AND status = 'open'
+                     AND previous_violation_id IS NOT NULL
+                     AND last_seen >= ?""",
+                (org_id, cutoff),
+            ).fetchone()
+
+        return {
+            "org_id": org_id,
+            "window_days": days,
+            "window_start": cutoff,
+            "new_last_Nd": new_row["cnt"] if new_row else 0,
+            "unchanged_last_Nd": unchanged_row["cnt"] if unchanged_row else 0,
+            "resolved_last_Nd": resolved_row["cnt"] if resolved_row else 0,
+        }
+
+    def lifecycle_history(self, finding_id: str, org_id: str, max_depth: int = 50) -> List[Dict[str, Any]]:
+        """Walk previous_violation_id chain, returning ancestors oldest-first.
+
+        Cycle-safe (bounded by ``max_depth`` and a visited set).
+        """
+        visited: set = set()
+        chain: List[Dict[str, Any]] = []
+        current_id: Optional[str] = finding_id
+        depth = 0
+
+        with self._conn() as conn:
+            while current_id and depth < max_depth:
+                if current_id in visited:
+                    break
+                visited.add(current_id)
+                row = conn.execute(
+                    """SELECT id, previous_violation_id, first_seen_at, last_seen,
+                              resolved_at, status, severity, title, correlation_key,
+                              scan_id, unchanged_scan_count
+                       FROM security_findings WHERE id = ? AND org_id = ?""",
+                    (current_id, org_id),
+                ).fetchone()
+                if not row:
+                    break
+                chain.append(self._row(row))
+                current_id = row["previous_violation_id"]
+                depth += 1
+
+        # chain is newest→oldest; return oldest→newest for readability
+        chain.reverse()
+        return chain
+
+    def count_lifecycle_by_day(self, org_id: str, day_iso: str) -> Dict[str, int]:
+        """Return new/unchanged/resolved counts for a single day (UTC date prefix).
+
+        Used by ``security_posture_history_engine`` to populate daily snapshots.
+        ``day_iso`` should be ``YYYY-MM-DD``.
+        """
+        day_prefix = day_iso[:10]
+        next_day = (datetime.fromisoformat(day_prefix) + timedelta(days=1)).date().isoformat()
+        with self._conn() as conn:
+            new_row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM security_findings
+                   WHERE org_id = ?
+                     AND first_seen_at >= ?
+                     AND first_seen_at < ?""",
+                (org_id, day_prefix, next_day),
+            ).fetchone()
+            resolved_row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM security_findings
+                   WHERE org_id = ?
+                     AND resolved_at IS NOT NULL
+                     AND resolved_at >= ?
+                     AND resolved_at < ?""",
+                (org_id, day_prefix, next_day),
+            ).fetchone()
+            unchanged_row = conn.execute(
+                """SELECT COUNT(*) AS cnt FROM security_findings
+                   WHERE org_id = ?
+                     AND status = 'open'
+                     AND previous_violation_id IS NOT NULL
+                     AND last_seen >= ?
+                     AND last_seen < ?""",
+                (org_id, day_prefix, next_day),
+            ).fetchone()
+        return {
+            "new": new_row["cnt"] if new_row else 0,
+            "unchanged": unchanged_row["cnt"] if unchanged_row else 0,
+            "resolved": resolved_row["cnt"] if resolved_row else 0,
+        }

@@ -1,0 +1,1 @@
+../../../suite-core/api/autofix_router.py

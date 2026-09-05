@@ -1,0 +1,325 @@
+/**
+ * Threat Hunting Dashboard
+ *
+ * Proactive hunt campaigns, queries, and findings.
+ *   1. KPIs: Active Hunts, Total Findings, Critical Findings, Queries Run
+ *   2. Active campaigns table (8 rows)
+ *   3. Query runner panel (6 queries)
+ *   4. Findings table (10 rows)
+ *   5. Hunt playbooks (4 cards)
+ *
+ * API stubs: GET /api/v1/threat-hunting/campaigns, /api/v1/threat-hunting/queries, /api/v1/threat-hunting/findings
+ */
+
+import { useState, useEffect } from "react";
+import { getStoredAuthToken, getStoredOrgId } from "@/lib/api";
+import { motion } from "framer-motion";
+import { Crosshair, AlertTriangle, Search, Play, RefreshCw, BookOpen, BarChart3, Shield } from "lucide-react";
+
+// ── API helpers ────────────────────────────────────────────────
+// Same-origin by default. A hardcoded http://localhost:8000 fallback means
+// the browser calls a host that is not this deployment: on any other port
+// the CSP "connect-src 'self'" blocks it outright and the page renders
+// empty with no visible error. Observed on 127.0.0.1:8001 —
+// /api/v1/findings and /api/v1/deduplication/stats both refused.
+import { API_BASE_URL as API_BASE } from "@/lib/api-config";
+const API_KEY =
+  (typeof window !== "undefined" && window.localStorage.getItem("aldeci.authToken")) ||
+  import.meta.env.VITE_API_KEY;
+const ORG_ID = (getStoredOrgId() ?? "default");
+
+async function apiFetch(path: string) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { "X-API-Key": API_KEY },
+  });
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  return res.json();
+}
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { PageHeader } from "@/components/shared/page-header";
+import { KpiCard } from "@/components/shared/kpi-card";
+import { EmptyState } from "@/components/shared/EmptyState";
+import { cn } from "@/lib/utils";
+
+// ── Mock data ──────────────────────────────────────────────────
+
+
+
+
+
+// ── Helpers ────────────────────────────────────────────────────
+
+function HuntTypeBadge({ type }: { type: string }) {
+  const map: Record<string, string> = {
+    ioc_match:           "border-blue-500/30 text-blue-400 bg-blue-500/10",
+    behavior_pattern:    "border-purple-500/30 text-purple-400 bg-purple-500/10",
+    lateral_movement:    "border-orange-500/30 text-orange-400 bg-orange-500/10",
+    exfiltration:        "border-red-500/30 text-red-400 bg-red-500/10",
+    anomaly_correlation: "border-cyan-500/30 text-cyan-400 bg-cyan-500/10",
+  };
+  return <Badge className={cn("text-[10px] border", map[type] ?? "border-border text-muted-foreground")}>{type.replace(/_/g, " ")}</Badge>;
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, string> = {
+    active:    "border-green-500/30 text-green-400 bg-green-500/10",
+    paused:    "border-yellow-500/30 text-yellow-400 bg-yellow-500/10",
+    completed: "border-muted text-muted-foreground",
+  };
+  return <Badge className={cn("text-[10px] border", map[status] ?? "border-border text-muted-foreground")}>{status}</Badge>;
+}
+
+function QueryTypeBadge({ type }: { type: string }) {
+  const map: Record<string, string> = {
+    KQL:   "border-blue-500/30 text-blue-400 bg-blue-500/10",
+    SPL:   "border-indigo-500/30 text-indigo-400 bg-indigo-500/10",
+    EQL:   "border-cyan-500/30 text-cyan-400 bg-cyan-500/10",
+    SIGMA: "border-purple-500/30 text-purple-400 bg-purple-500/10",
+    YARA:  "border-amber-500/30 text-amber-400 bg-amber-500/10",
+  };
+  return <Badge className={cn("text-[10px] border font-mono", map[type] ?? "border-border text-muted-foreground")}>{type}</Badge>;
+}
+
+function SevDot({ sev }: { sev: string }) {
+  const cls =
+    sev === "Critical" ? "bg-red-500" :
+    sev === "High"     ? "bg-amber-500" :
+    sev === "Medium"   ? "bg-yellow-400" : "bg-green-500";
+  return <span className={cn("inline-block w-2 h-2 rounded-full shrink-0", cls)} title={sev} />;
+}
+
+// ── Component ──────────────────────────────────────────────────
+
+const arr = (v: any): any[] => (Array.isArray(v) ? v : []);
+export default function ThreatHuntingDashboard() {
+  const [refreshing, setRefreshing] = useState(false);
+  const [liveData, setLiveData] = useState<any>(null);
+  const [dataLoading, setDataLoading] = useState(false);
+
+  useEffect(() => {
+    setDataLoading(true);
+    Promise.allSettled([
+      apiFetch(`/api/v1/threat-hunting/stats?org_id=${ORG_ID}`),
+      apiFetch(`/api/v1/threat-hunting/hunts?org_id=${ORG_ID}&limit=20`),
+    ]).then(([statsResult, huntsResult]) => {
+      const stats = statsResult.status === "fulfilled" ? statsResult.value : null;
+      const hunts = huntsResult.status === "fulfilled" ? huntsResult.value : null;
+      if (stats || hunts) {
+        setLiveData({ stats, sessions: hunts });
+      }
+    }).finally(() => setDataLoading(false));
+  }, []);
+
+  const handleRefresh = () => {
+    setRefreshing(true);
+    setTimeout(() => setRefreshing(false), 800);
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="flex flex-col gap-6"
+    >
+      {/* Header */}
+      <PageHeader
+        title="Threat Hunting"
+        description="Proactive hunt campaigns, queries, and findings"
+        actions={
+          <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing || dataLoading}>
+            <RefreshCw className={cn("h-4 w-4", (refreshing || dataLoading) && "animate-spin")} />
+          </Button>
+        }
+      />
+
+      {/* KPIs */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <KpiCard title="Active Hunts"     value={liveData?.stats?.active_sessions ?? liveData?.stats?.active_hunts ?? liveData?.stats?.hunt_count ?? "—"}   icon={Crosshair}     trend="up"   className="border-blue-500/20" />
+        <KpiCard title="Total Findings"   value={liveData?.stats?.total_findings ?? liveData?.stats?.findings ?? "—"}  icon={Search}        trend="up"   className="border-amber-500/20" />
+        <KpiCard title="Critical Findings" value={liveData?.stats?.critical_findings ?? "—"}  icon={AlertTriangle} trend="up"   className="border-red-500/20" />
+        <KpiCard title="Queries Run"      value={liveData?.stats?.queries_run ?? liveData?.stats?.queries_run_count ?? "—"} icon={BarChart3}     trend="up" />
+      </div>
+
+      {/* Active Campaigns */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-sm font-semibold flex items-center gap-2">
+              <Crosshair className="h-4 w-4 text-blue-400" />
+              Active Campaigns
+            </CardTitle>
+            <Button variant="outline" size="sm" className="h-7 text-xs">New Hunt</Button>
+          </div>
+          <CardDescription className="text-xs">Current hunt operations by analyst and MITRE tactic</CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="text-[11px] h-8">ID</TableHead>
+                  <TableHead className="text-[11px] h-8">Campaign Name</TableHead>
+                  <TableHead className="text-[11px] h-8">Type</TableHead>
+                  <TableHead className="text-[11px] h-8">MITRE Tactic</TableHead>
+                  <TableHead className="text-[11px] h-8">Analyst</TableHead>
+                  <TableHead className="text-[11px] h-8">Status</TableHead>
+                  <TableHead className="text-[11px] h-8">Started</TableHead>
+                  <TableHead className="text-[11px] h-8 text-right">Findings</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {(liveData?.sessions?.items ?? liveData?.sessions ?? []).length === 0 ? (
+                  <TableRow><TableCell colSpan={8}><EmptyState icon={Crosshair} title="No campaigns yet" description="Hunt campaigns will appear here once created." /></TableCell></TableRow>
+                ) : (arr(liveData?.sessions?.items ?? liveData?.sessions ?? [])).map((row: any) => (
+                  <TableRow key={row.id} className="hover:bg-muted/30">
+                    <TableCell className="text-xs font-mono py-2.5">{row.id}</TableCell>
+                    <TableCell className="text-xs py-2.5 max-w-[180px] truncate font-medium">{row.name}</TableCell>
+                    <TableCell className="py-2.5"><HuntTypeBadge type={row.hunt_type} /></TableCell>
+                    <TableCell className="text-xs py-2.5 font-mono text-muted-foreground">{row.mitre_tactic}</TableCell>
+                    <TableCell className="text-xs py-2.5 text-muted-foreground">{row.analyst}</TableCell>
+                    <TableCell className="py-2.5"><StatusBadge status={row.status} /></TableCell>
+                    <TableCell className="text-xs py-2.5 tabular-nums text-muted-foreground">{row.start}</TableCell>
+                    <TableCell className="text-xs py-2.5 text-right font-bold">
+                      <span className={row.findings > 5 ? "text-amber-400" : "text-muted-foreground"}>{row.findings}</span>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Query Runner */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-semibold flex items-center gap-2">
+            <Search className="h-4 w-4 text-purple-400" />
+            Query Runner
+          </CardTitle>
+          <CardDescription className="text-xs">Saved hunt queries across KQL, SPL, EQL, SIGMA, YARA</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {(liveData?.queries?.items ?? liveData?.queries ?? []).length === 0 ? (
+            <EmptyState icon={Search} title="No queries yet" description="Saved hunt queries will appear here once created." />
+          ) : (arr(liveData?.queries?.items ?? liveData?.queries ?? [])).map((q: any) => (
+            <div key={q.id} className="flex items-center gap-3 rounded-lg border border-border/50 bg-muted/20 p-3">
+              <QueryTypeBadge type={q.query_type} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-medium truncate">{q.name}</span>
+                  <span className="text-[10px] text-muted-foreground shrink-0">{q.data_source}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 h-1.5 rounded-full bg-muted/40 overflow-hidden">
+                    <motion.div
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(q.hits / q.max_hits) * 100}%` }}
+                      transition={{ duration: 0.7, ease: "easeOut" }}
+                      className={cn("h-full rounded-full", q.hits > 5 ? "bg-amber-500" : q.hits > 0 ? "bg-blue-500" : "bg-muted")}
+                    />
+                  </div>
+                  <span className="text-[10px] tabular-nums text-muted-foreground w-12 text-right">{q.hits} hits</span>
+                  <span className="text-[10px] text-muted-foreground">{q.last_run}</span>
+                </div>
+              </div>
+              <Button variant="outline" size="sm" className="h-7 px-3 text-xs shrink-0">
+                <Play className="h-3 w-3 mr-1" />Run
+              </Button>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+
+      {/* Findings table + Playbooks */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        {/* Findings — takes 2 cols */}
+        <Card className="lg:col-span-2">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-sm font-semibold flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-amber-400" />
+                Hunt Findings
+              </CardTitle>
+              <Badge className="text-[10px] border border-amber-500/30 text-amber-400 bg-amber-500/10">
+                {(liveData?.findings?.items ?? liveData?.findings ?? []).length} findings
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="text-[11px] h-8 w-6" />
+                    <TableHead className="text-[11px] h-8">Finding</TableHead>
+                    <TableHead className="text-[11px] h-8">Campaign</TableHead>
+                    <TableHead className="text-[11px] h-8">IOCs</TableHead>
+                    <TableHead className="text-[11px] h-8">Assets</TableHead>
+                    <TableHead className="text-[11px] h-8">Escalated</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(liveData?.findings?.items ?? liveData?.findings ?? []).length === 0 ? (
+                    <TableRow><TableCell colSpan={6}><EmptyState icon={AlertTriangle} title="No findings yet" description="Hunt findings will appear here once campaigns produce results." /></TableCell></TableRow>
+                  ) : (arr(liveData?.findings?.items ?? liveData?.findings ?? [])).map((row: any) => (
+                    <TableRow key={row.id} className="hover:bg-muted/30">
+                      <TableCell className="py-2.5 pl-4"><SevDot sev={row.sev} /></TableCell>
+                      <TableCell className="text-xs py-2.5 max-w-[200px] truncate font-medium">{row.title}</TableCell>
+                      <TableCell className="text-xs py-2.5 font-mono text-muted-foreground">{row.campaign}</TableCell>
+                      <TableCell className="py-2.5">
+                        <Badge className="text-[10px] border border-border text-muted-foreground">{row.iocs} IOCs</Badge>
+                      </TableCell>
+                      <TableCell className="text-xs py-2.5 text-muted-foreground">{row.assets}</TableCell>
+                      <TableCell className="py-2.5">
+                        {row.escalated
+                          ? <Badge className="text-[10px] border border-red-500/30 text-red-400 bg-red-500/10">Escalated</Badge>
+                          : <span className="text-[10px] text-muted-foreground">—</span>}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Hunt Playbooks */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-semibold flex items-center gap-2">
+              <BookOpen className="h-4 w-4 text-indigo-400" />
+              Hunt Playbooks
+            </CardTitle>
+            <CardDescription className="text-xs">Reusable hunting procedures</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {(liveData?.playbooks?.items ?? liveData?.playbooks ?? []).length === 0 ? (
+              <EmptyState icon={BookOpen} title="No playbooks yet" description="Hunt playbooks will appear here once configured." />
+            ) : (arr(liveData?.playbooks?.items ?? liveData?.playbooks ?? [])).map((pb: any) => (
+              <div key={pb.id} className="rounded-lg border border-border/50 bg-muted/20 p-3 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <span className="text-xs font-medium leading-tight">{pb.title}</span>
+                  <Badge className="text-[10px] border border-border text-muted-foreground shrink-0">{pb.steps} steps</Badge>
+                </div>
+                <HuntTypeBadge type={pb.hunt_type} />
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {(arr(pb.techniques ?? [])).map((t: string) => (
+                    <span key={t} className="text-[9px] font-mono bg-muted/40 rounded px-1.5 py-0.5 text-muted-foreground">{t}</span>
+                  ))}
+                </div>
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px] w-full mt-1">
+                  <Shield className="h-3 w-3 mr-1" />Run Playbook
+                </Button>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      </div>
+    </motion.div>
+  );
+}

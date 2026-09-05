@@ -1,0 +1,538 @@
+"""
+Analytics database manager using SQLite.
+"""
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from core.analytics_models import (
+    Decision,
+    DecisionOutcome,
+    Finding,
+    FindingSeverity,
+    FindingStatus,
+    Metric,
+)
+
+
+class AnalyticsDB:
+    """Database manager for analytics records."""
+
+    def __init__(self, db_path: str = "data/analytics.db"):
+        """Initialize database connection."""
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_tables()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get database connection."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_tables(self):
+        """Initialize database tables."""
+        conn = self._get_connection()
+        try:
+            # Step 1: create base tables (without org_id index — added after migration)
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS findings (
+                    id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL DEFAULT 'default',
+                    application_id TEXT,
+                    service_id TEXT,
+                    rule_id TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    cve_id TEXT,
+                    cvss_score REAL,
+                    epss_score REAL,
+                    exploitable INTEGER NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id TEXT PRIMARY KEY,
+                    finding_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    reasoning TEXT NOT NULL,
+                    llm_votes TEXT,
+                    policy_matched TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (finding_id) REFERENCES findings(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS metrics (
+                    id TEXT PRIMARY KEY,
+                    metric_type TEXT NOT NULL,
+                    metric_name TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    unit TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    metadata TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
+                CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
+                CREATE INDEX IF NOT EXISTS idx_findings_created ON findings(created_at);
+                CREATE INDEX IF NOT EXISTS idx_decisions_finding ON decisions(finding_id);
+                CREATE INDEX IF NOT EXISTS idx_decisions_outcome ON decisions(outcome);
+                CREATE INDEX IF NOT EXISTS idx_metrics_type ON metrics(metric_type);
+                CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
+            """
+            )
+            conn.commit()
+            # Step 2: migrate existing DBs that lack org_id column (created before this change)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+            if "org_id" not in cols:
+                conn.execute(
+                    "ALTER TABLE findings ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default'"
+                )
+                conn.commit()
+            # Step 3: ensure org index exists (safe to run after migration)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_findings_org ON findings(org_id)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def create_finding(self, finding: Finding) -> Finding:
+        """Create new finding."""
+        if not finding.id:
+            finding.id = str(uuid.uuid4())
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO findings
+                   (id, org_id, application_id, service_id, rule_id, severity, status,
+                    title, description, source, cve_id, cvss_score, epss_score,
+                    exploitable, metadata, created_at, updated_at, resolved_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    finding.id,
+                    getattr(finding, "org_id", "default") or "default",
+                    finding.application_id,
+                    finding.service_id,
+                    finding.rule_id,
+                    finding.severity.value,
+                    finding.status.value,
+                    finding.title,
+                    finding.description,
+                    finding.source,
+                    finding.cve_id,
+                    finding.cvss_score,
+                    finding.epss_score,
+                    1 if finding.exploitable else 0,
+                    json.dumps(finding.metadata),
+                    finding.created_at.isoformat(),
+                    finding.updated_at.isoformat(),
+                    finding.resolved_at.isoformat() if finding.resolved_at else None,
+                ),
+            )
+            conn.commit()
+            return finding
+        finally:
+            conn.close()
+
+    def get_finding(self, finding_id: str) -> Optional[Finding]:
+        """Get finding by ID."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM findings WHERE id = ?", (finding_id,)
+            ).fetchone()
+            if row:
+                return self._row_to_finding(row)
+            return None
+        finally:
+            conn.close()
+
+    def list_findings(
+        self,
+        org_id: Optional[str] = None,
+        severity: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Finding]:
+        """List findings with optional filtering, optionally scoped to org_id."""
+        conn = self._get_connection()
+        try:
+            # Graceful: check if org_id column exists
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+            has_org = "org_id" in cols
+
+            query = "SELECT * FROM findings WHERE 1=1"
+            params: List[Any] = []
+
+            if org_id is not None and has_org:
+                query += " AND org_id = ?"
+                params.append(org_id)
+            elif org_id is not None and not has_org:
+                import logging as _l
+                _l.getLogger(__name__).warning("analytics_db: findings.org_id column missing — returning all findings")
+
+            if severity:
+                query += " AND severity = ?"
+                params.append(severity)
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_finding(row) for row in rows]
+        finally:
+            conn.close()
+
+    def count_findings(
+        self,
+        org_id: Optional[str] = None,
+        severity: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> int:
+        """Return total count of findings matching the same filters as list_findings."""
+        conn = self._get_connection()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+            has_org = "org_id" in cols
+            query = "SELECT COUNT(*) FROM findings WHERE 1=1"
+            params: List[Any] = []
+            if org_id is not None and has_org:
+                query += " AND org_id = ?"
+                params.append(org_id)
+            if severity:
+                query += " AND severity = ?"
+                params.append(severity)
+            if status:
+                query += " AND status = ?"
+                params.append(status)
+            row = conn.execute(query, params).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def update_finding(self, finding: Finding) -> Finding:
+        """Update finding."""
+        finding.updated_at = datetime.now(timezone.utc)
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """UPDATE findings SET status=?, metadata=?, updated_at=?, resolved_at=? WHERE id=?""",
+                (
+                    finding.status.value,
+                    json.dumps(finding.metadata),
+                    finding.updated_at.isoformat(),
+                    finding.resolved_at.isoformat() if finding.resolved_at else None,
+                    finding.id,
+                ),
+            )
+            conn.commit()
+            return finding
+        finally:
+            conn.close()
+
+    def delete_finding(self, finding_id: str) -> bool:
+        """Delete finding by ID. Returns True if a row was deleted."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("DELETE FROM findings WHERE id = ?", (finding_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def create_decision(self, decision: Decision) -> Decision:
+        """Create new decision."""
+        if not decision.id:
+            decision.id = str(uuid.uuid4())
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    decision.id,
+                    decision.finding_id,
+                    decision.outcome.value,
+                    decision.confidence,
+                    decision.reasoning,
+                    json.dumps(decision.llm_votes),
+                    decision.policy_matched,
+                    decision.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+            return decision
+        finally:
+            conn.close()
+
+    def list_decisions(
+        self,
+        org_id: Optional[str] = None,
+        finding_id: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Decision]:
+        """List decisions with optional filtering, optionally scoped to org_id."""
+        conn = self._get_connection()
+        try:
+            # Graceful: check if org_id column exists (via findings join is not possible here,
+            # so we filter via a subquery if org_id is requested and the column exists on findings)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(decisions)").fetchall()}
+            has_org = "org_id" in cols
+
+            query = "SELECT * FROM decisions WHERE 1=1"
+            params: List[Any] = []
+
+            if org_id is not None and has_org:
+                query += " AND org_id = ?"
+                params.append(org_id)
+            elif org_id is not None and not has_org:
+                # decisions table has no org_id column — scope via finding_id → findings.org_id
+                fcols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+                if "org_id" in fcols:
+                    query += " AND finding_id IN (SELECT id FROM findings WHERE org_id = ?)"
+                    params.append(org_id)
+                else:
+                    import logging as _l
+                    _l.getLogger(__name__).warning("analytics_db: decisions+findings lack org_id — returning all decisions")
+
+            if finding_id:
+                query += " AND finding_id = ?"
+                params.append(finding_id)
+
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_decision(row) for row in rows]
+        finally:
+            conn.close()
+
+    def create_metric(self, metric: Metric) -> Metric:
+        """Create new metric."""
+        if not metric.id:
+            metric.id = str(uuid.uuid4())
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO metrics VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    metric.id,
+                    metric.metric_type,
+                    metric.metric_name,
+                    metric.value,
+                    metric.unit,
+                    metric.timestamp.isoformat(),
+                    json.dumps(metric.metadata),
+                ),
+            )
+            conn.commit()
+            return metric
+        finally:
+            conn.close()
+
+    def list_metrics(
+        self,
+        metric_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[Metric]:
+        """List metrics with optional filtering."""
+        conn = self._get_connection()
+        try:
+            query = "SELECT * FROM metrics WHERE 1=1"
+            params: List[Any] = []
+
+            if metric_type:
+                query += " AND metric_type = ?"
+                params.append(metric_type)
+            if start_time:
+                query += " AND timestamp >= ?"
+                params.append(start_time.isoformat())
+            if end_time:
+                query += " AND timestamp <= ?"
+                params.append(end_time.isoformat())
+
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_metric(row) for row in rows]
+        finally:
+            conn.close()
+
+    def get_dashboard_overview(self, org_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get dashboard overview statistics, scoped to org_id when provided."""
+        conn = self._get_connection()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+            has_org = "org_id" in cols
+            org_clause = " AND org_id = ?" if (org_id and has_org) else ""
+            org_params = [org_id] if (org_id and has_org) else []
+
+            total_findings = conn.execute(
+                f"SELECT COUNT(*) FROM findings WHERE 1=1{org_clause}",  # nosec B608
+                org_params,
+            ).fetchone()[0]
+            open_findings = conn.execute(
+                f"SELECT COUNT(*) FROM findings WHERE status = 'open'{org_clause}",  # nosec B608
+                org_params,
+            ).fetchone()[0]
+            critical_findings = conn.execute(
+                f"SELECT COUNT(*) FROM findings WHERE severity = 'critical' AND status = 'open'{org_clause}",  # nosec B608
+                org_params,
+            ).fetchone()[0]
+
+            thirty_days_ago = (
+                datetime.now(timezone.utc) - timedelta(days=30)
+            ).isoformat()
+            recent_findings = conn.execute(
+                f"SELECT COUNT(*) FROM findings WHERE created_at >= ?{org_clause}",  # nosec B608
+                [thirty_days_ago] + org_params,
+            ).fetchone()[0]
+
+            return {
+                "total_findings": total_findings,
+                "open_findings": open_findings,
+                "critical_findings": critical_findings,
+                "recent_findings_30d": recent_findings,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        finally:
+            conn.close()
+
+    def get_top_risks(self, limit: int = 10, org_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get top risks by severity and exploitability, scoped to org_id when provided."""
+        conn = self._get_connection()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+            has_org = "org_id" in cols
+            org_clause = " AND org_id = ?" if (org_id and has_org) else ""
+            org_params = [org_id] if (org_id and has_org) else []
+
+            rows = conn.execute(
+                f"""SELECT * FROM findings
+                   WHERE status = 'open'{org_clause}
+                   ORDER BY
+                     CASE severity
+                       WHEN 'critical' THEN 1
+                       WHEN 'high' THEN 2
+                       WHEN 'medium' THEN 3
+                       WHEN 'low' THEN 4
+                       ELSE 5
+                     END,
+                     exploitable DESC,
+                     cvss_score DESC
+                   LIMIT ?""",  # nosec B608
+                org_params + [limit],
+            ).fetchall()
+            return [self._row_to_finding(row).to_dict() for row in rows]
+        finally:
+            conn.close()
+
+    def calculate_mttr(self, org_id: Optional[str] = None) -> Optional[float]:
+        """Calculate mean time to remediation in hours, optionally scoped to org_id."""
+        conn = self._get_connection()
+        try:
+            query = "SELECT created_at, resolved_at FROM findings WHERE resolved_at IS NOT NULL"
+            params: List[Any] = []
+            if org_id is not None:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+                if "org_id" in cols:
+                    query += " AND org_id = ?"
+                    params.append(org_id)
+            rows = conn.execute(query, params).fetchall()
+
+            if not rows:
+                return None
+
+            total_hours = 0.0
+            valid_count = 0
+            for row in rows:
+                try:
+                    created = datetime.fromisoformat(row["created_at"])
+                    resolved = datetime.fromisoformat(row["resolved_at"])
+                    # Normalize both to naive UTC to avoid offset-naive vs offset-aware errors
+                    if created.tzinfo is not None:
+                        created = created.replace(tzinfo=None)
+                    if resolved.tzinfo is not None:
+                        resolved = resolved.replace(tzinfo=None)
+                    hours = (resolved - created).total_seconds() / 3600
+                    if hours >= 0:
+                        total_hours += hours
+                        valid_count += 1
+                except (ValueError, TypeError):
+                    continue
+
+            return total_hours / valid_count if valid_count > 0 else None
+        finally:
+            conn.close()
+
+    def _row_to_finding(self, row) -> Finding:
+        """Convert database row to Finding object."""
+        row_keys = row.keys() if hasattr(row, "keys") else []
+        return Finding(
+            id=row["id"],
+            rule_id=row["rule_id"],
+            severity=FindingSeverity(row["severity"]),
+            status=FindingStatus(row["status"]),
+            title=row["title"],
+            description=row["description"],
+            source=row["source"],
+            org_id=row["org_id"] if "org_id" in row_keys else "default",
+            application_id=row["application_id"],
+            service_id=row["service_id"],
+            cve_id=row["cve_id"],
+            cvss_score=row["cvss_score"],
+            epss_score=row["epss_score"],
+            exploitable=bool(row["exploitable"]),
+            metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            resolved_at=(
+                datetime.fromisoformat(row["resolved_at"])
+                if row["resolved_at"]
+                else None
+            ),
+        )
+
+    def _row_to_decision(self, row) -> Decision:
+        """Convert database row to Decision object."""
+        return Decision(
+            id=row["id"],
+            finding_id=row["finding_id"],
+            outcome=DecisionOutcome(row["outcome"]),
+            confidence=row["confidence"],
+            reasoning=row["reasoning"],
+            llm_votes=json.loads(row["llm_votes"]) if row["llm_votes"] else {},
+            policy_matched=row["policy_matched"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def _row_to_metric(self, row) -> Metric:
+        """Convert database row to Metric object."""
+        return Metric(
+            id=row["id"],
+            metric_type=row["metric_type"],
+            metric_name=row["metric_name"],
+            value=row["value"],
+            unit=row["unit"],
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+        )

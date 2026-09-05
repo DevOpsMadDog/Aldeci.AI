@@ -1,0 +1,49 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: 23.7.0
+    hooks:
+      - id: black
+        exclude: ^(archive|archive_not_needed)/
+  - repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+      - id: isort
+        exclude: ^(archive|archive_not_needed)/
+  - repo: https://github.com/pycqa/flake8
+    rev: 6.1.0
+    hooks:
+      - id: flake8
+        exclude: ^(archive|archive_not_needed)/
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: end-of-file-fixer
+        exclude: ^(archive|archive_not_needed)/
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: check-yaml
+        args: ['--allow-multiple-documents']
+      - id: detect-private-key
+  # Secret detection — SP3-007
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: >-
+          (?x)^(
+            .*\.lock$|
+            .*package-lock\.json$|
+            .*\.min\.js$|
+            archive/.*|
+            archive_not_needed/.*|
+            data/.*\.db$|
+            \.claude/.*
+          )$
+  # Gitleaks for comprehensive secret scanning
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        exclude: ^(archive|archive_not_needed|\.claude)/

@@ -1,0 +1,1 @@
+../../../suite-core/api/mindsdb_router.py

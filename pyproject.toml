@@ -1,0 +1,109 @@
+[tool.black]
+line-length = 88
+target-version = ['py311']
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | venv
+  | build
+  | dist
+  | WIP
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip_gitignore = true
+extend_skip = ["WIP"]
+known_third_party = ["ssvc"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+testpaths = ["tests"]
+pythonpath = [".", "suite-api", "suite-core", "suite-attack", "suite-feeds", "suite-integrations", "suite-evidence-risk"]
+timeout = 10
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--strict-config",
+    # --- Package-name coverage (packages with __init__.py) ---
+    "--cov=core",
+    "--cov=risk",
+    "--cov=automation",
+    "--cov=cli",
+    "--cov=feeds_service",
+    "--cov=services",
+    "--cov=agents",
+    "--cov=compliance",
+    "--cov=evidence",
+    "--cov=connectors",
+    "--cov=domain",
+    "--cov=policy",
+    "--cov=telemetry",
+    "--cov=integrations",
+    "--cov=reports",
+    # --- Filesystem-path coverage (namespace packages without __init__.py) ---
+    "--cov=suite-core/api",
+    "--cov=suite-core/schemas",
+    "--cov=suite-core/simulations",
+    # --- Explicit suite-path coverage (all suites) ---
+    "--cov=suite-core/core",
+    "--cov=suite-api/apps",
+    "--cov=suite-api/backend",
+    "--cov=suite-feeds/api",
+    "--cov=suite-attack/api",
+    "--cov=suite-integrations/api",
+    "--cov=suite-evidence-risk/api",
+    "--cov=suite-evidence-risk/risk",
+    "--cov=suite-evidence-risk/evidence",
+    "--cov=suite-evidence-risk/compliance",
+    "--cov=suite-integrations/integrations",
+    "--cov=suite-integrations/ssvc",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+    # Coverage threshold is enforced explicitly in CI for full-suite runs.
+    "--durations=10",
+    "-ra",
+]
+markers = [
+    "integration: Integration tests",
+    "perf: Performance benchmark tests (used by CI perf gate)",
+    "benchmark: Micro-benchmark tests measuring raw throughput or latency",
+    "slow: Slow running tests",
+    "security: Security-related tests",
+    "requires_network: Tests that require network access",
+    "requires_docker: Tests that require Docker",
+    "requires_k8s: Tests that require Kubernetes",
+    "asyncio: Async tests using pytest-asyncio",
+    "owasp: OWASP regression lockdown tests",
+    "live: Real-moat tests that make live paid LLM calls (nightly only; needs API key + network; not air-gap)",
+]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s [%(levelname)8s] %(name)s: %(message)s"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+asyncio_mode = "auto"
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore::pytest.PytestConfigWarning",
+    "ignore:Unclosed.*MemoryObject.*:ResourceWarning",
+    "ignore::ResourceWarning",
+    "ignore:Duplicate Operation ID:UserWarning",
+    "ignore:Field name .* shadows an attribute in parent:UserWarning",
+    "ignore:Module .* was never imported\\.:coverage.exceptions.CoverageWarning",
+    # starlette 1.x raises StarletteDeprecationWarning(UserWarning) when httpx is used
+    # without httpx2. httpx2 is installed so this path should never fire, but guard it
+    # here so a future environment without httpx2 doesn't hard-error on collection.
+    # StarletteDeprecationWarning subclasses UserWarning (NOT DeprecationWarning) so
+    # the existing ignore::DeprecationWarning does NOT cover it — this entry is required.
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
+]
+

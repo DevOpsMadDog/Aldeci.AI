@@ -1,0 +1,89 @@
+# Open queue — single source of truth
+
+Everything still owed, in one place, so no thread goes stale. Updated 2026-08-18.
+
+Closed work lives in `SELLABLE_BACKLOG_2026-08-17.md` (20 of 28 done) and in the ADRs.
+This file is only what remains. **Nothing here is abandoned; it is queued.**
+
+Ordered by what unblocks a sale, not by effort.
+
+---
+
+## P0 — a customer sees this and stops trusting the product
+
+| # | Item | Evidence | Closes when |
+|---|---|---|---|
+| Q1 | **80 human screens are reachable and return nothing or fail** — `asset-inventory`, `audit`, `certificates`, `ciso-report`, … | measured across 745 domains. **Materially advanced**: the 3 genuine 500s are gone, and the 404 class turned out to be the error envelope overruling handlers that had a useful message (`11d96141`) — screens read "missing" when they meant "empty, run a scan" | each is wired, or dormant; a reachable menu item never dead-ends |
+| ~~Q2~~ | ~~Redeploy~~ **DONE** — fly v82 live; cross-tenant breach verified sealed *in production*, login returns a real role and org | verified against aldeci.fly.dev | closed |
+| Q3 | **Click the remaining screens** — Respond, Evidence, Onboarding | every defect so far only appeared when something was pressed | each action verified to persist, same method as Triage |
+| Q25 | **A P0 was found by creating one real account** — cross-tenant read/write via a named org. Closed in `513cdc13`+`9ca5afb3`. The lesson is the queue item: *onboard as a real customer and press the buttons*, because four layers of this were invisible to code review | `docs/SECURITY_FINDING_cross_tenant_org_id.md` | run the same exercise against a second real persona |
+| ~~Q22~~ | ~~5 SSO config 401s~~ **DONE — and it was the TEST that was wrong.** The tests called `/api/v1/auth/sso` with NO credentials and asserted 200, encoding an auth hole as expected behaviour. SSO config carries IdP metadata and certificates; serving it unauthenticated would be the defect. Tests now authenticate; 5/5 pass | closed |
+| ~~Q23~~ | ~~Rebuild + redeploy~~ **DONE** — both now serve a build where password login yields a role | verified live on :8000 and fly | closed |
+| ~~Q24~~ | ~~Remove probe accounts from fly~~ **DONE** — 3 `@probe.example` rows deleted; planted entitlements were never on the volume | verified: 8 users → 5 | closed |
+| Q26 | **5 stale test accounts predate this session on the fly volume** — `cr2+`, `cr3+`, `crfinal+`, `crrec+`, `custtest+` `@example.com`. Not mine to delete; flagging rather than removing | `flyctl ssh console` inventory | founder decides: purge or keep as fixtures |
+
+## P1 — the product thesis (ADR-010 / ADR-011)
+
+| # | Item | Why it matters | Closes when |
+|---|---|---|---|
+| ~~Q4~~ | ~~Wire exploit analysis~~ **DONE** — reachability and exploit evidence are now FUSED into one verdict per finding (act_now / schedule / watch / defer), carrying whether the evidence was measured or estimated. Persisted through the store and shown in the UI | 12 tests | closed |
+| Q5 | **Per-stage verdict history** | a finding needs *many* verdicts over time, not one overwritten field — this is what makes prediction→confirmation measurable | `(finding, stage, verdict, timestamp)` is stored and queryable |
+| Q6 | **Forecasting at plan/design** | the honest question where there is no target: how likely is this to *become* exploitable (EPSS trajectory, KEV-addition likelihood) | a design-stage finding carries a forecast, labelled predicted |
+| Q7 | **MPTE target providers** | one engine, five providers: nothing at design, ephemeral container at build/test (`sandbox_verifier.py`), staging at release, production at operate | MPTE reports "no target at this stage" rather than silently skipping |
+| Q8 | **Measure reachability's filtering value** | mechanism proven (42,796 edges, 6.2s) — noise reduction on a *customer* repo is still unmeasured | a real repo, a published percentage, not an assumption |
+| ~~Q9~~ | ~~Customer-declarable graph~~ **DONE** — a tenant declares entity types, attaches entities and writes correlation rules; the pipeline applies them AFTER its own measurement, attributes every change to the rule that made it, and refuses any action that would invent a measurement | 14 tests | closed |
+
+## P2 — surface and shape (the eight flows)
+
+| # | Item | Detail | Closes when |
+|---|---|---|---|
+| Q10 | **Decide the 183 unassigned domains** | 44 carry real tenant data — fold into a flow, demote to API-only, or retire. Not a blanket switch | each has a decision recorded |
+| ~~Q11~~ | ~~Flow 02 — the spine~~ **DONE** — ingest→see→triage persists, verified in production with real trivy output | `eb4e13f4` | closed |
+| ~~Q12~~ | ~~Flow 04 — the assessor path~~ **DONE** — generation was a stub returning invented page counts and a hash of its own metadata; now produces a real persisted pack (22 controls assessed, 18 effective) and lists. Signing remains a separate step, deliberately unclaimed | `4212663c` | closed; signing is Q27 |
+| Q13 | **D2 — core membership by evidence** | membership generated from (tenant-varying data ∧ UI callsite), not curated by hand | list is generated |
+| Q14 | **D3 — execute dormancy** | ~290 engine-domain orphans, in verified batches | route count drops by the expected delta each batch, gates stay green |
+
+| ~~Q27~~ | ~~Sign an evidence bundle~~ **DONE** — RSA-SHA256 over the content hash, persisted as a `.sig.json` sidecar, verified by the API and by a standalone offline script. Forged and malformed signatures both answer rather than crash | 11 tests | closed |
+| Q31 | **evidence-collector and evidence-vault are still silos** | fed by nothing, return zeros. No longer advertised to customers, but an unfed feature is either wired or retired | each wired to generation, or retired |
+| ~~Q28~~ | ~~6 competing evidence subsystems~~ **DONE** — a loose `startswith` made core mode advertise four families; segment-boundary matching took the customer surface 455→308 paths and evidence 57→30. evidence-chain is no longer a silo: generation feeds and seals it | `6a1755f8` | closed |
+| Q29 | **773 request models let the client name its own tenant** | ratcheted in `test_tenant_comes_from_the_credential.py`; the dangerous forms are all closed, the field remains | count trends down; no new ones |
+| Q30 | **322 narrow `except` guards may hide database errors** | 4 telemetry ones widened. The rest need reading individually — blanket-widening swallows real faults | each audited, or a rule written for which may widen |
+
+## P3 — debt with a ratchet already on it
+
+| # | Item | Current | Closes when |
+|---|---|---|---|
+| Q15 | **E2 — relative DB paths** | 155 files hardcode them and ignore `FIXOPS_DATA_DIR`; ratchet in `test_no_relative_db_paths.py` | count reaches 0 |
+| Q16 | **B4 — duplicated contract models** | `CapabilityResponse` ×46, `ScanRequest` ×24 re-declared per router | shared, and duplicate class-name count materially below 4,213 |
+| Q17 | **F1 — rename Families 1–2** | we call it SAST/DAST; we normalise other tools' output. 2 of 15 and 1 of 13 domains carry data | no surface claims a scan a normalizer merely ingests |
+| ~~Q18~~ | ~~Offline bundle verifier~~ **DONE** — `scripts/verify_evidence_bundle.py` imports nothing from FixOps and needs no network; `GET /api/v1/evidence/public-key` publishes the key. Verified in test: passes an untouched bundle, exits 1 on an edited one | 11 tests | closed |
+
+## P4 — blocked on hardware or a decision only the founder makes
+
+| # | Item | Blocker |
+|---|---|---|
+| Q19 | **C4 — air-gapped council proof, green** | needs inference-sized hardware. Mechanic proven (2 local models, independent reasoning, **zero egress**); laptop CPU exceeds 10 min on the six-key verdict prompt and falls back to labelled heuristics |
+| Q20 | **C2 — vendor-free council member set** | partly present: `_enforce_air_gap_providers()` already swaps providers and fails closed. Needs the member set driven by profile |
+| Q21 | **Authenticated verification against fly** | the deployed `FIXOPS_API_TOKEN` was rotated in an earlier session and is unreadable; rotating it is a live change I will not make unasked |
+
+---
+
+## Standing rules this session established
+
+These are not tasks; they are how the work is judged, and they caught every defect above.
+
+1. **Click it, then read the data back.** Triage returned `{"processed": 1}` and changed
+   nothing. AutoFix generated a fix and then threw it away on an audit call. Neither was
+   visible from code review.
+2. **A number nobody measured must not be displayed.** `0ms` health tiles, `"< 24h"` MTTD,
+   controls asserting "effective" on a run that did nothing.
+3. **Absence is a fact worth stating.** "not configured", "not assessed", "no bundle
+   imported" — never an invented substitute.
+4. **Two components can each be correct while the product lies.** Split stores, wrong
+   identifier space, field-name mismatch, a response shape the caller reads one field
+   deeper than the sender writes. Check the join.
+5. **Defensive code must not degrade into the failure it defends against.** `list_users`
+   checked for the tenancy column, logged that it was missing, and then returned every
+   user in every org. A guard that widens access on failure is worse than no guard.
+6. **The client never decides its own privileges.** The API-key login hardcoded
+   `role: "admin"`; only the server knows what a credential was granted.

@@ -1,0 +1,1 @@
+../../../suite-core/api/mcp_protocol_router.py

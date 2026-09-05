@@ -1,0 +1,1517 @@
+{
+  "scan_date": "2026-04-13T13:01:39.165410+00:00",
+  "aldeci_version": "beast-mode-v6",
+  "scan_run_id": "b033b64c-d766-4027-aae2-d3df7661ec07",
+  "total_scan_duration_s": 1043.4,
+  "repos": [
+    {
+      "name": "nanoGPT",
+      "url": "https://github.com/karpathy/nanoGPT.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:44:16.847417+00:00",
+      "sast_findings": {
+        "critical": 16,
+        "high": 1,
+        "medium": 10,
+        "low": 18,
+        "total": 45,
+        "files_scanned": 15
+      },
+      "secrets_found": 0,
+      "iac_findings": 0,
+      "dependencies": 0,
+      "license": "MIT",
+      "risk_score": 40.0,
+      "top_cwes": [
+        "CWE-134",
+        "CWE-190",
+        "CWE-502",
+        "CWE-755",
+        "CWE-770"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 15,
+          "total_findings": 45,
+          "by_severity": {
+            "medium": 10,
+            "critical": 16,
+            "low": 18,
+            "high": 1
+          },
+          "cwe_ids_found": [
+            "CWE-134",
+            "CWE-190",
+            "CWE-502",
+            "CWE-755",
+            "CWE-770",
+            "CWE-95"
+          ],
+          "duration_s": 0.07,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 24,
+          "total_findings": 0,
+          "by_severity": {},
+          "categories_found": [],
+          "duration_s": 0.14,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.0,
+          "error": null
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 0,
+          "risk_by_level": {},
+          "high_risk_packages": [],
+          "duration_s": 0.0,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "MIT"
+          ],
+          "primary_license": "MIT",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "fastapi",
+      "url": "https://github.com/tiangolo/fastapi.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:44:25.411647+00:00",
+      "sast_findings": {
+        "critical": 1,
+        "high": 3,
+        "medium": 100,
+        "low": 30,
+        "total": 134,
+        "files_scanned": 100
+      },
+      "secrets_found": 128,
+      "iac_findings": 0,
+      "dependencies": 96,
+      "license": "MIT",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-1004",
+        "CWE-208",
+        "CWE-306",
+        "CWE-307",
+        "CWE-352"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 134,
+          "by_severity": {
+            "medium": 100,
+            "low": 30,
+            "high": 3,
+            "critical": 1
+          },
+          "cwe_ids_found": [
+            "CWE-1004",
+            "CWE-208",
+            "CWE-306",
+            "CWE-307",
+            "CWE-352",
+            "CWE-434",
+            "CWE-521",
+            "CWE-614",
+            "CWE-755",
+            "CWE-770",
+            "CWE-798"
+          ],
+          "duration_s": 0.8,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 2749,
+          "total_findings": 128,
+          "by_severity": {
+            "high": 124,
+            "low": 4
+          },
+          "categories_found": [
+            "certificate",
+            "generic_password",
+            "generic_secret",
+            "jwt",
+            "oauth"
+          ],
+          "duration_s": 5.17,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.08,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 96,
+          "risk_by_level": {
+            "low": 96
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.03,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "MIT"
+          ],
+          "primary_license": "MIT",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "flask",
+      "url": "https://github.com/pallets/flask.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:44:28.369588+00:00",
+      "sast_findings": {
+        "critical": 24,
+        "high": 16,
+        "medium": 73,
+        "low": 43,
+        "total": 156,
+        "files_scanned": 83
+      },
+      "secrets_found": 11,
+      "iac_findings": 0,
+      "dependencies": 110,
+      "license": "BSD-3-Clause",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-1004",
+        "CWE-1336",
+        "CWE-190",
+        "CWE-20",
+        "CWE-200"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 83,
+          "total_findings": 156,
+          "by_severity": {
+            "low": 43,
+            "medium": 73,
+            "high": 16,
+            "critical": 24
+          },
+          "cwe_ids_found": [
+            "CWE-1004",
+            "CWE-1336",
+            "CWE-190",
+            "CWE-20",
+            "CWE-200",
+            "CWE-256",
+            "CWE-307",
+            "CWE-326",
+            "CWE-327",
+            "CWE-352",
+            "CWE-384",
+            "CWE-489",
+            "CWE-502",
+            "CWE-601",
+            "CWE-614",
+            "CWE-754",
+            "CWE-755",
+            "CWE-760",
+            "CWE-770",
+            "CWE-798",
+            "CWE-95"
+          ],
+          "duration_s": 1.04,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 227,
+          "total_findings": 11,
+          "by_severity": {
+            "high": 9,
+            "low": 2
+          },
+          "categories_found": [
+            "generic_password",
+            "generic_secret"
+          ],
+          "duration_s": 0.44,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.01,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 110,
+          "risk_by_level": {
+            "low": 110
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.01,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "BSD-3-Clause"
+          ],
+          "primary_license": "BSD-3-Clause",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "requests",
+      "url": "https://github.com/psf/requests.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:44:31.088356+00:00",
+      "sast_findings": {
+        "critical": 22,
+        "high": 85,
+        "medium": 85,
+        "low": 115,
+        "total": 307,
+        "files_scanned": 36
+      },
+      "secrets_found": 18,
+      "iac_findings": 0,
+      "dependencies": 42,
+      "license": "Apache-2.0",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-1004",
+        "CWE-134",
+        "CWE-20",
+        "CWE-200",
+        "CWE-295"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 36,
+          "total_findings": 307,
+          "by_severity": {
+            "high": 85,
+            "low": 115,
+            "medium": 85,
+            "critical": 22
+          },
+          "cwe_ids_found": [
+            "CWE-1004",
+            "CWE-134",
+            "CWE-20",
+            "CWE-200",
+            "CWE-295",
+            "CWE-319",
+            "CWE-326",
+            "CWE-327",
+            "CWE-329",
+            "CWE-434",
+            "CWE-477",
+            "CWE-502",
+            "CWE-522",
+            "CWE-598",
+            "CWE-614",
+            "CWE-755",
+            "CWE-770",
+            "CWE-798",
+            "CWE-918",
+            "CWE-93"
+          ],
+          "duration_s": 0.66,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 118,
+          "total_findings": 18,
+          "by_severity": {
+            "high": 10,
+            "critical": 4,
+            "medium": 4
+          },
+          "categories_found": [
+            "certificate",
+            "generic_password",
+            "private_key"
+          ],
+          "duration_s": 0.8,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.01,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 42,
+          "risk_by_level": {
+            "low": 42
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.0,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "Apache-2.0"
+          ],
+          "primary_license": "Apache-2.0",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "django",
+      "url": "https://github.com/django/django.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:44:53.007963+00:00",
+      "sast_findings": {
+        "critical": 3,
+        "high": 15,
+        "medium": 69,
+        "low": 44,
+        "total": 131,
+        "files_scanned": 100
+      },
+      "secrets_found": 252,
+      "iac_findings": 0,
+      "dependencies": 28,
+      "license": "BSD-3-Clause",
+      "risk_score": 75.0,
+      "top_cwes": [
+        "CWE-1004",
+        "CWE-134",
+        "CWE-190",
+        "CWE-20",
+        "CWE-327"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 131,
+          "by_severity": {
+            "medium": 69,
+            "high": 15,
+            "low": 44,
+            "critical": 3
+          },
+          "cwe_ids_found": [
+            "CWE-1004",
+            "CWE-134",
+            "CWE-190",
+            "CWE-20",
+            "CWE-327",
+            "CWE-434",
+            "CWE-489",
+            "CWE-502",
+            "CWE-601",
+            "CWE-614",
+            "CWE-704",
+            "CWE-755",
+            "CWE-760",
+            "CWE-770",
+            "CWE-78",
+            "CWE-79"
+          ],
+          "duration_s": 1.94,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 6922,
+          "total_findings": 252,
+          "by_severity": {
+            "high": 252
+          },
+          "categories_found": [
+            "database",
+            "generic_password",
+            "generic_secret"
+          ],
+          "duration_s": 16.32,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.17,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 28,
+          "risk_by_level": {
+            "low": 28
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.22,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 2,
+          "spdx_ids_detected": [
+            "BSD-3-Clause",
+            "GPL-2.0"
+          ],
+          "primary_license": "BSD-3-Clause",
+          "violations": [
+            "GPL-2.0: strong_copyleft"
+          ],
+          "compliant": false,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "langchain",
+      "url": "https://github.com/langchain-ai/langchain.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:45:03.171410+00:00",
+      "sast_findings": {
+        "critical": 13,
+        "high": 10,
+        "medium": 2,
+        "low": 1,
+        "total": 26,
+        "files_scanned": 100
+      },
+      "secrets_found": 40,
+      "iac_findings": 0,
+      "dependencies": 285,
+      "license": "MIT",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-327",
+        "CWE-502",
+        "CWE-611",
+        "CWE-755",
+        "CWE-770"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 26,
+          "by_severity": {
+            "low": 1,
+            "medium": 2,
+            "high": 10,
+            "critical": 13
+          },
+          "cwe_ids_found": [
+            "CWE-327",
+            "CWE-502",
+            "CWE-611",
+            "CWE-755",
+            "CWE-770",
+            "CWE-798",
+            "CWE-918"
+          ],
+          "duration_s": 1.64,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 2771,
+          "total_findings": 40,
+          "by_severity": {
+            "high": 40
+          },
+          "categories_found": [
+            "generic_password",
+            "generic_secret",
+            "slack"
+          ],
+          "duration_s": 5.51,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.11,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 285,
+          "risk_by_level": {
+            "low": 285
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.05,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "MIT"
+          ],
+          "primary_license": "MIT",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "transformers",
+      "url": "https://github.com/huggingface/transformers.git",
+      "language": "python",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:45:44.726678+00:00",
+      "sast_findings": {
+        "critical": 152,
+        "high": 22,
+        "medium": 43,
+        "low": 108,
+        "total": 325,
+        "files_scanned": 100
+      },
+      "secrets_found": 122,
+      "iac_findings": 0,
+      "dependencies": 70,
+      "license": "Apache-2.0",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-190",
+        "CWE-200",
+        "CWE-22",
+        "CWE-327",
+        "CWE-330"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 325,
+          "by_severity": {
+            "low": 108,
+            "medium": 43,
+            "critical": 152,
+            "high": 22
+          },
+          "cwe_ids_found": [
+            "CWE-190",
+            "CWE-200",
+            "CWE-22",
+            "CWE-327",
+            "CWE-330",
+            "CWE-434",
+            "CWE-502",
+            "CWE-521",
+            "CWE-532",
+            "CWE-754",
+            "CWE-755",
+            "CWE-770",
+            "CWE-918",
+            "CWE-95"
+          ],
+          "duration_s": 3.46,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 5748,
+          "total_findings": 122,
+          "by_severity": {
+            "high": 121,
+            "medium": 1
+          },
+          "categories_found": [
+            "aws",
+            "generic_password",
+            "generic_secret",
+            "oauth"
+          ],
+          "duration_s": 33.23,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.2,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 70,
+          "risk_by_level": {
+            "low": 70
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.09,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "Apache-2.0"
+          ],
+          "primary_license": "Apache-2.0",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "golang-go",
+      "url": "https://github.com/golang/go.git",
+      "language": "go",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:46:50.161339+00:00",
+      "sast_findings": {
+        "critical": 0,
+        "high": 0,
+        "medium": 8,
+        "low": 0,
+        "total": 8,
+        "files_scanned": 100
+      },
+      "secrets_found": 335,
+      "iac_findings": 0,
+      "dependencies": 24,
+      "license": "BSD-3-Clause",
+      "risk_score": 46.0,
+      "top_cwes": [
+        "CWE-252"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 8,
+          "by_severity": {
+            "medium": 8
+          },
+          "cwe_ids_found": [
+            "CWE-252"
+          ],
+          "duration_s": 0.23,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 15012,
+          "total_findings": 335,
+          "by_severity": {
+            "high": 266,
+            "medium": 44,
+            "low": 20,
+            "critical": 5
+          },
+          "categories_found": [
+            "certificate",
+            "database",
+            "generic_password",
+            "generic_secret",
+            "private_key"
+          ],
+          "duration_s": 59.42,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.16,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 24,
+          "risk_by_level": {
+            "low": 24
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.15,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "BSD-3-Clause"
+          ],
+          "primary_license": "BSD-3-Clause",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "deno",
+      "url": "https://github.com/denoland/deno.git",
+      "language": "rust",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:47:17.562316+00:00",
+      "sast_findings": {
+        "critical": 364,
+        "high": 44,
+        "medium": 154,
+        "low": 0,
+        "total": 562,
+        "files_scanned": 100
+      },
+      "secrets_found": 128,
+      "iac_findings": 0,
+      "dependencies": 108,
+      "license": "MIT",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-1004",
+        "CWE-22",
+        "CWE-327",
+        "CWE-346",
+        "CWE-502"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 562,
+          "by_severity": {
+            "medium": 154,
+            "critical": 364,
+            "high": 44
+          },
+          "cwe_ids_found": [
+            "CWE-1004",
+            "CWE-22",
+            "CWE-327",
+            "CWE-346",
+            "CWE-502",
+            "CWE-601",
+            "CWE-613",
+            "CWE-614",
+            "CWE-770",
+            "CWE-78",
+            "CWE-798",
+            "CWE-918",
+            "CWE-93"
+          ],
+          "duration_s": 1.83,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 11381,
+          "total_findings": 128,
+          "by_severity": {
+            "high": 69,
+            "low": 2,
+            "medium": 27,
+            "critical": 30
+          },
+          "categories_found": [
+            "certificate",
+            "database",
+            "generic_password",
+            "generic_secret",
+            "npm",
+            "private_key"
+          ],
+          "duration_s": 19.38,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.44,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 108,
+          "risk_by_level": {
+            "low": 108
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.33,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "MIT"
+          ],
+          "primary_license": "MIT",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "express",
+      "url": "https://github.com/expressjs/express.git",
+      "language": "javascript",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:47:19.629970+00:00",
+      "sast_findings": {
+        "critical": 4,
+        "high": 22,
+        "medium": 79,
+        "low": 0,
+        "total": 105,
+        "files_scanned": 100
+      },
+      "secrets_found": 9,
+      "iac_findings": 0,
+      "dependencies": 44,
+      "license": "MIT",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-1004",
+        "CWE-113",
+        "CWE-22",
+        "CWE-319",
+        "CWE-502"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 105,
+          "by_severity": {
+            "medium": 79,
+            "critical": 4,
+            "high": 22
+          },
+          "cwe_ids_found": [
+            "CWE-1004",
+            "CWE-113",
+            "CWE-22",
+            "CWE-319",
+            "CWE-502",
+            "CWE-601",
+            "CWE-614",
+            "CWE-79",
+            "CWE-89",
+            "CWE-918",
+            "CWE-93"
+          ],
+          "duration_s": 0.76,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 213,
+          "total_findings": 9,
+          "by_severity": {
+            "high": 9
+          },
+          "categories_found": [
+            "generic_password",
+            "generic_secret"
+          ],
+          "duration_s": 0.25,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.01,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 44,
+          "risk_by_level": {
+            "low": 44
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.01,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "MIT"
+          ],
+          "primary_license": "MIT",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "nextjs",
+      "url": "https://github.com/vercel/next.js.git",
+      "language": "typescript",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:48:18.440354+00:00",
+      "sast_findings": {
+        "critical": 80,
+        "high": 1,
+        "medium": 4,
+        "low": 0,
+        "total": 85,
+        "files_scanned": 100
+      },
+      "secrets_found": 270,
+      "iac_findings": 0,
+      "dependencies": 1007,
+      "license": "UNKNOWN",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-327",
+        "CWE-502",
+        "CWE-78",
+        "CWE-918"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 85,
+          "by_severity": {
+            "critical": 80,
+            "high": 1,
+            "medium": 4
+          },
+          "cwe_ids_found": [
+            "CWE-327",
+            "CWE-502",
+            "CWE-78",
+            "CWE-918"
+          ],
+          "duration_s": 0.19,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 26742,
+          "total_findings": 270,
+          "by_severity": {
+            "high": 259,
+            "critical": 7,
+            "medium": 4
+          },
+          "categories_found": [
+            "certificate",
+            "database",
+            "generic_password",
+            "generic_secret",
+            "oauth",
+            "private_key"
+          ],
+          "duration_s": 49.13,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.94,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 1007,
+          "risk_by_level": {
+            "low": 1007
+          },
+          "high_risk_packages": [],
+          "duration_s": 1.18,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 0,
+          "spdx_ids_detected": [],
+          "primary_license": "UNKNOWN",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "react",
+      "url": "https://github.com/facebook/react.git",
+      "language": "javascript",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:48:34.205608+00:00",
+      "sast_findings": {
+        "critical": 356,
+        "high": 2,
+        "medium": 53,
+        "low": 0,
+        "total": 411,
+        "files_scanned": 100
+      },
+      "secrets_found": 52,
+      "iac_findings": 0,
+      "dependencies": 376,
+      "license": "MIT",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-208",
+        "CWE-327",
+        "CWE-330",
+        "CWE-502",
+        "CWE-613"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 411,
+          "by_severity": {
+            "critical": 356,
+            "medium": 53,
+            "high": 2
+          },
+          "cwe_ids_found": [
+            "CWE-208",
+            "CWE-327",
+            "CWE-330",
+            "CWE-502",
+            "CWE-613",
+            "CWE-78",
+            "CWE-798",
+            "CWE-918"
+          ],
+          "duration_s": 1.06,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 6784,
+          "total_findings": 52,
+          "by_severity": {
+            "low": 2,
+            "high": 50
+          },
+          "categories_found": [
+            "generic_password",
+            "generic_secret"
+          ],
+          "duration_s": 11.56,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.13,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 376,
+          "risk_by_level": {
+            "low": 376
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.06,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [
+            "MIT"
+          ],
+          "primary_license": "MIT",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    },
+    {
+      "name": "linux",
+      "url": "https://github.com/torvalds/linux.git",
+      "language": "c",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T12:58:52.361253+00:00",
+      "sast_findings": {
+        "critical": 0,
+        "high": 7,
+        "medium": 0,
+        "low": 0,
+        "total": 7,
+        "files_scanned": 100
+      },
+      "secrets_found": 2473,
+      "iac_findings": 0,
+      "dependencies": 8,
+      "license": "UNKNOWN",
+      "risk_score": 65.0,
+      "top_cwes": [
+        "CWE-120"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 7,
+          "by_severity": {
+            "high": 7
+          },
+          "cwe_ids_found": [
+            "CWE-120"
+          ],
+          "duration_s": 1.42,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 92790,
+          "total_findings": 2473,
+          "by_severity": {
+            "high": 2464,
+            "low": 8,
+            "critical": 1
+          },
+          "categories_found": [
+            "certificate",
+            "generic_password",
+            "generic_secret",
+            "private_key"
+          ],
+          "duration_s": 584.15,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 2.91,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 8,
+          "risk_by_level": {
+            "low": 8
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.8,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 0,
+          "spdx_ids_detected": [],
+          "primary_license": "UNKNOWN",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": "[Errno 21] Is a directory: '/tmp/aldeci-e2e/linux/LICENSES'"
+        }
+      }
+    },
+    {
+      "name": "kubernetes",
+      "url": "https://github.com/kubernetes/kubernetes.git",
+      "language": "go",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T13:01:23.833487+00:00",
+      "sast_findings": {
+        "critical": 0,
+        "high": 5,
+        "medium": 46,
+        "low": 0,
+        "total": 51,
+        "files_scanned": 100
+      },
+      "secrets_found": 802,
+      "iac_findings": 0,
+      "dependencies": 144,
+      "license": "UNKNOWN",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-250",
+        "CWE-327",
+        "CWE-918"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 51,
+          "by_severity": {
+            "medium": 46,
+            "high": 5
+          },
+          "cwe_ids_found": [
+            "CWE-250",
+            "CWE-327",
+            "CWE-918"
+          ],
+          "duration_s": 5.29,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 29157,
+          "total_findings": 802,
+          "by_severity": {
+            "high": 589,
+            "low": 6,
+            "medium": 106,
+            "critical": 101
+          },
+          "categories_found": [
+            "aws",
+            "certificate",
+            "database",
+            "docker",
+            "generic_password",
+            "generic_secret",
+            "jwt",
+            "oauth",
+            "private_key"
+          ],
+          "duration_s": 122.11,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 10.67,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 144,
+          "risk_by_level": {
+            "low": 144
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.51,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 0,
+          "spdx_ids_detected": [],
+          "primary_license": "UNKNOWN",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": "[Errno 21] Is a directory: '/tmp/aldeci-e2e/kubernetes/LICENSES'"
+        }
+      }
+    },
+    {
+      "name": "terraform",
+      "url": "https://github.com/hashicorp/terraform.git",
+      "language": "go",
+      "clone_ok": true,
+      "clone_error": null,
+      "scanned_at": "2026-04-13T13:01:39.165368+00:00",
+      "sast_findings": {
+        "critical": 0,
+        "high": 1,
+        "medium": 67,
+        "low": 0,
+        "total": 68,
+        "files_scanned": 100
+      },
+      "secrets_found": 58,
+      "iac_findings": 0,
+      "dependencies": 115,
+      "license": "UNKNOWN",
+      "risk_score": 70.0,
+      "top_cwes": [
+        "CWE-252",
+        "CWE-327"
+      ],
+      "scanners": {
+        "sast": {
+          "engine": "sast",
+          "files_scanned": 100,
+          "total_findings": 68,
+          "by_severity": {
+            "medium": 67,
+            "high": 1
+          },
+          "cwe_ids_found": [
+            "CWE-252",
+            "CWE-327"
+          ],
+          "duration_s": 1.95,
+          "error": null
+        },
+        "secrets": {
+          "engine": "secrets",
+          "files_scanned": 5154,
+          "total_findings": 58,
+          "by_severity": {
+            "high": 43,
+            "medium": 4,
+            "critical": 10,
+            "low": 1
+          },
+          "categories_found": [
+            "certificate",
+            "generic_password",
+            "generic_secret",
+            "pgp",
+            "private_key"
+          ],
+          "duration_s": 10.3,
+          "error": null
+        },
+        "iac": {
+          "engine": "iac",
+          "files_scanned": 0,
+          "total_findings": 0,
+          "by_severity": {},
+          "formats_found": [],
+          "duration_s": 0.37,
+          "error": "'ScanResult' object has no attribute 'format'"
+        },
+        "dependency": {
+          "engine": "dependency",
+          "dependencies_found": 115,
+          "risk_by_level": {
+            "low": 115
+          },
+          "high_risk_packages": [],
+          "duration_s": 0.2,
+          "error": null
+        },
+        "license": {
+          "engine": "license",
+          "license_files_found": 1,
+          "spdx_ids_detected": [],
+          "primary_license": "UNKNOWN",
+          "violations": [],
+          "compliant": true,
+          "duration_s": 0.0,
+          "error": null
+        }
+      }
+    }
+  ],
+  "summary": {
+    "total_repos": 15,
+    "repos_successfully_scanned": 15,
+    "repos_failed": 0,
+    "total_findings": 7119,
+    "avg_risk_score": 66.4,
+    "highest_risk_repo": "django"
+  }
+}

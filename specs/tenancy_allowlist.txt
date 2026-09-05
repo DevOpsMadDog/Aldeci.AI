@@ -1,0 +1,5 @@
+# SPEC-007 tenancy violation allowlist — frozen debt.
+# Format: relative/path/to/file.py:lineno:CATEGORY
+# This list may only SHRINK. Never add new entries manually.
+# Generated violations: 0
+

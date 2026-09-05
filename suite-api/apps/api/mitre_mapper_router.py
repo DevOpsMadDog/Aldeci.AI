@@ -1,0 +1,1 @@
+../../../suite-core/api/mitre_mapper_router.py

@@ -1,0 +1,1 @@
+../../../suite-core/api/knowledge_graph_router.py

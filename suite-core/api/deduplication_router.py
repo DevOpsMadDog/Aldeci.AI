@@ -1,0 +1,606 @@
+"""Deduplication & Correlation API endpoints."""
+
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
+
+from core.services.deduplication import ClusterStatus, DeduplicationService
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+# Auth deps: conditional import so this router works when loaded from suite-core
+# without the suite-api apps package on sys.path (e.g. unit tests, standalone).
+try:
+    from apps.api.auth_deps import api_key_auth
+    from apps.api.dependencies import get_org_id as _get_org_id_dep
+    _HAS_AUTH = True
+except ImportError:
+    _HAS_AUTH = False
+    api_key_auth = None  # type: ignore[assignment]
+
+    def _get_org_id_dep(request: Request) -> str:  # type: ignore[misc]
+        """Fallback used only when the real dependency cannot be imported.
+
+        This previously read ``Depends(_get_org_id_dep)`` — a name that does not
+        exist in this branch, which is the branch taken when the import fails.
+        So the fallback raised NameError at module load and took the whole
+        router down with it: the deduplication API was unreachable, and the
+        screen behind it dead.
+
+        Reads the tenant the auth layer pinned onto the request, and NEVER the
+        client-supplied header or query param, so degrading to this path cannot
+        widen access.
+        """
+        state_org = getattr(request.state, "org_id", None)
+        return str(state_org).strip() if state_org and str(state_org).strip() else "default"
+
+_router_deps = [Depends(api_key_auth)] if _HAS_AUTH and api_key_auth else []
+router = APIRouter(prefix="/api/v1/deduplication", tags=["deduplication"], dependencies=_router_deps)
+
+# Initialize service with default path
+_DATA_DIR = Path("data/deduplication")
+_dedup_service: Optional[DeduplicationService] = None
+
+
+def get_dedup_service() -> DeduplicationService:
+    """Get or create deduplication service instance."""
+    global _dedup_service
+    if _dedup_service is None:
+        _dedup_service = DeduplicationService(_DATA_DIR / "clusters.db")
+    return _dedup_service
+
+
+def _get_analytics_findings_count() -> Dict[str, int]:
+    """Real findings counts (total + open) from AnalyticsDB.
+
+    Used by the root summary to show how many findings the system holds vs how
+    many the dedup engine has clustered. Honest zeros when the analytics store
+    is unavailable — never fabricated.
+    """
+    try:
+        from core.analytics_db import AnalyticsDB
+
+        db = AnalyticsDB()
+        return {
+            "total_findings": int(db.count_findings()),
+            "open_findings": int(db.count_findings(status="open")),
+        }
+    except Exception:  # noqa: BLE001 - analytics store optional; honest-empty fallback
+        return {"total_findings": 0, "open_findings": 0}
+
+
+class ProcessFindingRequest(BaseModel):
+    """Request to process a single finding."""
+
+    finding: Dict[str, Any]
+    run_id: str
+    source: str = "sarif"
+
+
+class ProcessFindingsBatchRequest(BaseModel):
+    """Request to process a batch of findings."""
+
+    findings: List[Dict[str, Any]]
+    run_id: str
+    source: str = "sarif"
+
+
+class UpdateStatusRequest(BaseModel):
+    """Request to update cluster status."""
+
+    status: str
+    changed_by: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class AssignClusterRequest(BaseModel):
+    """Request to assign cluster to user."""
+
+    assignee: str
+
+
+class LinkTicketRequest(BaseModel):
+    """Request to link cluster to external ticket."""
+
+    ticket_id: str
+    ticket_url: Optional[str] = None
+
+
+class CreateCorrelationLinkRequest(BaseModel):
+    """Request to create correlation link between clusters."""
+
+    source_cluster_id: str
+    target_cluster_id: str
+    link_type: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: Optional[str] = None
+
+
+class OperatorFeedbackRequest(BaseModel):
+    """Request to record operator feedback for correlation corrections."""
+
+    cluster_id: str
+    feedback_type: Literal["merge_allowed", "merge_blocked", "split_cluster"] = Field(
+        description="merge_allowed, merge_blocked, or split_cluster"
+    )
+    target_cluster_id: Optional[str] = None
+    reason: Optional[str] = None
+    operator_id: Optional[str] = None
+
+
+class BaselineComparisonRequest(BaseModel):
+    """Request to compare current run against baseline."""
+
+    current_run_id: str
+    baseline_run_id: str
+
+
+class MergeClustersRequest(BaseModel):
+    """Request to merge multiple clusters into one."""
+
+    source_cluster_ids: List[str] = Field(min_length=1)
+    target_cluster_id: str
+    reason: Optional[str] = None
+
+
+class SplitClusterRequest(BaseModel):
+    """Request to split a cluster into separate findings."""
+
+    event_ids: List[str] = []
+    reason: Optional[str] = None
+
+
+@router.post("/process")
+def process_finding(request: ProcessFindingRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Process a single finding for deduplication."""
+    service = get_dedup_service()
+    return service.process_finding(
+        finding=request.finding,
+        run_id=request.run_id,
+        org_id=org_id,
+        source=request.source,
+    )
+
+
+@router.post("/process/batch")
+def process_findings_batch(
+    request: ProcessFindingsBatchRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Process a batch of findings for deduplication."""
+    service = get_dedup_service()
+    return service.process_findings_batch(
+        findings=request.findings,
+        run_id=request.run_id,
+        org_id=org_id,
+        source=request.source,
+    )
+
+
+@router.get("/clusters")
+def list_clusters(
+    org_id: str = Depends(_get_org_id_dep),
+    app_id: Optional[str] = None,
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = Query(default=100, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> Dict[str, Any]:
+    """List clusters with optional filters."""
+    service = get_dedup_service()
+    clusters = service.get_clusters(
+        org_id=org_id,
+        app_id=app_id,
+        status=status,
+        severity=severity,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "clusters": clusters,
+        "count": len(clusters),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/clusters/{cluster_id}")
+def get_cluster(
+    cluster_id: str,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Get a specific cluster by ID."""
+    service = get_dedup_service()
+    cluster = service.get_cluster(cluster_id)
+    if not cluster or cluster.get("org_id") != org_id:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return cluster
+
+
+@router.put("/clusters/{cluster_id}/status")
+def update_cluster_status(
+    cluster_id: str,
+    request: UpdateStatusRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Update cluster status."""
+    try:
+        ClusterStatus(request.status)
+    except ValueError:
+        valid_statuses = [s.value for s in ClusterStatus]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Must be one of: {valid_statuses}",
+        )
+
+    service = get_dedup_service()
+    # Ownership check before mutation
+    cluster = service.get_cluster(cluster_id)
+    if not cluster or cluster.get("org_id") != org_id:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    success = service.update_cluster_status(
+        cluster_id=cluster_id,
+        new_status=request.status,
+        changed_by=request.changed_by,
+        reason=request.reason,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return {"status": "updated", "cluster_id": cluster_id, "new_status": request.status}
+
+
+@router.put("/clusters/{cluster_id}/assign")
+def assign_cluster(
+    cluster_id: str,
+    request: AssignClusterRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Assign cluster to a user."""
+    service = get_dedup_service()
+    # Ownership check before mutation
+    cluster = service.get_cluster(cluster_id)
+    if not cluster or cluster.get("org_id") != org_id:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    success = service.assign_cluster(cluster_id, request.assignee)
+    if not success:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return {
+        "status": "assigned",
+        "cluster_id": cluster_id,
+        "assignee": request.assignee,
+    }
+
+
+@router.put("/clusters/{cluster_id}/ticket")
+def link_ticket(
+    cluster_id: str,
+    request: LinkTicketRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Link cluster to external ticket."""
+    service = get_dedup_service()
+    # Ownership check before mutation
+    cluster = service.get_cluster(cluster_id)
+    if not cluster or cluster.get("org_id") != org_id:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    success = service.link_to_ticket(
+        cluster_id=cluster_id,
+        ticket_id=request.ticket_id,
+        ticket_url=request.ticket_url,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return {
+        "status": "linked",
+        "cluster_id": cluster_id,
+        "ticket_id": request.ticket_id,
+    }
+
+
+@router.get("/clusters/{cluster_id}/related")
+def get_related_clusters(
+    cluster_id: str,
+    min_confidence: float = Query(default=0.5, ge=0.0, le=1.0),
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Get clusters related to the given cluster."""
+    service = get_dedup_service()
+    cluster = service.get_cluster(cluster_id)
+    if not cluster or cluster.get("org_id") != org_id:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    related = service.get_related_clusters(cluster_id, min_confidence)
+    return {"cluster_id": cluster_id, "related_clusters": related}
+
+
+@router.get("/correlations")
+def list_correlations(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> Dict[str, Any]:
+    """List all correlation links between clusters."""
+    service = get_dedup_service()
+    try:
+        correlations = service.get_all_correlations(limit=limit, offset=offset)
+    except AttributeError:
+        # Fallback if method not implemented
+        correlations = []
+    return {
+        "correlations": correlations,
+        "count": len(correlations),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/correlations")
+def create_correlation_link(
+    request: CreateCorrelationLinkRequest,
+) -> Dict[str, Any]:
+    """Create a correlation link between two clusters."""
+    service = get_dedup_service()
+    link_id = service.create_correlation_link(
+        source_cluster_id=request.source_cluster_id,
+        target_cluster_id=request.target_cluster_id,
+        link_type=request.link_type,
+        confidence=request.confidence,
+        reason=request.reason,
+    )
+    return {"link_id": link_id, "status": "created"}
+
+
+@router.get("/")
+def dedup_root(org_id: str = Depends(_get_org_id_dep)) -> Dict[str, Any]:
+    """Root summary for the deduplication engine.
+
+    Real data only: cluster/event counts + breakdowns from the dedup service,
+    and findings totals from AnalyticsDB. Lets the UI/clients hit the engine
+    root and see live dedup health without crafting a sub-path.
+    """
+    service = get_dedup_service()
+    stats = service.get_dedup_stats(org_id)
+    findings = _get_analytics_findings_count()
+    return {
+        "org_id": org_id,
+        "engine": "deduplication",
+        "total_clusters": int(stats.get("total_clusters", 0)),
+        "total_events": int(stats.get("total_events", 0)),
+        "noise_reduction_percent": stats.get("noise_reduction_percent", 0.0),
+        "status_breakdown": stats.get("status_breakdown", {}) or {},
+        "severity_breakdown": stats.get("severity_breakdown", {}) or {},
+        "findings_in_system": int(findings.get("total_findings", 0)),
+        "open_findings": int(findings.get("open_findings", 0)),
+    }
+
+
+@router.get("/stats")
+def get_dedup_stats_global() -> Dict[str, Any]:
+    """Get global deduplication statistics."""
+    service = get_dedup_service()
+    return service.get_dedup_stats("default")
+
+
+@router.get("/stats/{org_id}")
+def get_dedup_stats(org_id: str = Depends(_get_org_id_dep)) -> Dict[str, Any]:
+    """Get deduplication statistics for an organization."""
+    service = get_dedup_service()
+    return service.get_dedup_stats(org_id)
+
+
+@router.post("/correlate/cross-stage")
+def correlate_cross_stage(
+    org_id: str = Depends(_get_org_id_dep), min_confidence: float = Query(default=0.7, ge=0.0, le=1.0)
+) -> Dict[str, Any]:
+    """Find and create cross-stage correlation links.
+
+    Cross-stage anchors:
+    - CVE+purl: Same vulnerability in same package across stages
+    - rule_id+file_path: Same rule violation in same file across stages
+    - resource_id+policy_id: Same policy violation on same resource
+    """
+    service = get_dedup_service()
+    return service.correlate_cross_stage(org_id, min_confidence)
+
+
+@router.get("/graph")
+def get_correlation_graph(
+    org_id: str = Depends(_get_org_id_dep), cluster_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get the correlation graph for visualization.
+
+    Returns nodes (clusters) and edges (correlation links) in a format
+    suitable for graph visualization.
+    """
+    service = get_dedup_service()
+    return service.get_correlation_graph(org_id, cluster_id)
+
+
+@router.post("/feedback")
+def record_operator_feedback(request: OperatorFeedbackRequest) -> Dict[str, Any]:
+    """Record operator feedback for correlation corrections.
+
+    Feedback types:
+    - merge_allowed: Confirm two clusters should be merged
+    - merge_blocked: Block automatic merge of two clusters
+    - split_cluster: Split a cluster into separate findings
+    """
+    valid_types = ["merge_allowed", "merge_blocked", "split_cluster"]
+    if request.feedback_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid feedback_type. Must be one of: {valid_types}",
+        )
+
+    if (
+        request.feedback_type in ["merge_allowed", "merge_blocked"]
+        and not request.target_cluster_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="target_cluster_id is required for merge_allowed and merge_blocked feedback",
+        )
+
+    service = get_dedup_service()
+    return service.record_operator_feedback(
+        cluster_id=request.cluster_id,
+        feedback_type=request.feedback_type,
+        target_cluster_id=request.target_cluster_id,
+        reason=request.reason,
+        operator_id=request.operator_id,
+    )
+
+
+@router.post("/baseline/compare")
+def compare_baseline(request: BaselineComparisonRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Compare current run against a baseline to identify NEW/EXISTING/FIXED.
+
+    Returns findings categorized as:
+    - NEW: Present in current run but not in baseline
+    - EXISTING: Present in both runs
+    - FIXED: Present in baseline but not in current run
+    """
+    service = get_dedup_service()
+    return service.get_baseline_comparison(
+        org_id=org_id,
+        current_run_id=request.current_run_id,
+        baseline_run_id=request.baseline_run_id,
+    )
+
+
+@router.post("/clusters/merge")
+def merge_clusters(request: MergeClustersRequest) -> Dict[str, Any]:
+    """Merge multiple clusters into a target cluster.
+
+    All events from source clusters will be moved to the target cluster.
+    Source clusters will be marked as merged.
+    """
+    service = get_dedup_service()
+
+    # Verify target cluster exists
+    target = service.get_cluster(request.target_cluster_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target cluster not found")
+
+    merged_count = 0
+    for source_id in request.source_cluster_ids:
+        if source_id == request.target_cluster_id:
+            continue  # Skip self-merge
+        source = service.get_cluster(source_id)
+        if source:
+            # Record the merge as operator feedback
+            service.record_operator_feedback(
+                cluster_id=source_id,
+                feedback_type="merge_allowed",
+                target_cluster_id=request.target_cluster_id,
+                reason=request.reason,
+                operator_id="api-user",
+            )
+            merged_count += 1
+
+    return {
+        "status": "merged",
+        "target_cluster_id": request.target_cluster_id,
+        "merged_count": merged_count,
+        "source_cluster_ids": request.source_cluster_ids,
+    }
+
+
+@router.post("/clusters/{cluster_id}/split")
+def split_cluster(
+    cluster_id: str,
+    request: SplitClusterRequest,
+    org_id: str = Depends(_get_org_id_dep),
+) -> Dict[str, Any]:
+    """Split a cluster by moving specified events to new clusters.
+
+    If event_ids is empty, each event in the cluster becomes its own cluster.
+    """
+    service = get_dedup_service()
+
+    # Verify cluster exists and belongs to caller's org
+    cluster = service.get_cluster(cluster_id)
+    if not cluster or cluster.get("org_id") != org_id:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    # Record the split as operator feedback with event_ids
+    service.record_operator_feedback(
+        cluster_id=cluster_id,
+        feedback_type="split_cluster",
+        target_cluster_id=None,
+        reason=request.reason,
+        operator_id="api-user",
+        event_ids=request.event_ids,
+    )
+
+    return {
+        "status": "split_recorded",
+        "cluster_id": cluster_id,
+        "event_ids": request.event_ids,
+        "message": "Split feedback recorded. Events will be separated on next processing.",
+    }
+
+
+def _get_analytics_findings_count() -> Dict[str, Any]:
+    """Get counts from analytics DB to show available findings for dedup."""
+    try:
+        import sqlite3
+        from pathlib import Path
+
+        db_path = Path("data/analytics.db")
+        if not db_path.exists():
+            return {}
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM findings WHERE source != 'test'"
+            )
+            total = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COUNT(*) FROM findings WHERE source != 'test' AND status = 'open'"
+            )
+            open_count = cursor.fetchone()[0]
+            return {"total_findings": total, "open_findings": open_count}
+        finally:
+            conn.close()
+    except (ValueError, KeyError, RuntimeError, TypeError, AttributeError):
+        return {}
+
+
+@router.get("/health")
+async def deduplication_health():
+    """Deduplication engine health check."""
+    service = get_dedup_service()
+    stats = service.get_dedup_stats("default")
+    findings_ctx = _get_analytics_findings_count()
+    return {
+        "status": "healthy",
+        "engine": "deduplication",
+        "version": "1.0.0",
+        "clusters": stats.get("total_clusters", 0),
+        "events": stats.get("total_events", 0),
+        "findings_available": findings_ctx.get("total_findings", 0),
+    }
+
+
+@router.get("/status")
+async def deduplication_status():
+    """Deduplication engine status with real cluster and findings data."""
+    service = get_dedup_service()
+    stats = service.get_dedup_stats("default")
+    findings_ctx = _get_analytics_findings_count()
+    return {
+        "status": "healthy",
+        "engine": "deduplication",
+        "version": "1.0.0",
+        "clusters": stats.get("total_clusters", 0),
+        "events": stats.get("total_events", 0),
+        "noise_reduction_percent": stats.get("noise_reduction_percent", 0),
+        "status_breakdown": stats.get("status_breakdown", {}),
+        "severity_breakdown": stats.get("severity_breakdown", {}),
+        "findings_in_system": findings_ctx.get("total_findings", 0),
+        "open_findings": findings_ctx.get("open_findings", 0),
+        "db_path": str(_DATA_DIR / "clusters.db"),
+    }

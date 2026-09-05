@@ -1,0 +1,96 @@
+# PYSEC-2026-161 CLOSED 2026-06-01: starlette>=1.0.1 fixes the CVE.
+# fastapi>=0.133 is the first version that allows starlette>=1.0 (no upper bound).
+# httpx2>=2.2.0 is required by starlette 1.x TestClient (replaces httpx in test transport).
+# httpx is kept for runtime HTTP calls (connectors, feeds, etc.) — starlette's testclient
+# now imports httpx2 first so no StarletteDeprecationWarning fires at test collection.
+fastapi>=0.133,<0.137
+starlette>=1.0.1,<2.0
+uvicorn>=0.30.0,<1.0
+pydantic>=2.6,<3.0
+email-validator>=2.0.0,<3.0
+python-multipart>=0.0.26,<1.0
+requests>=2.33.0,<3.0
+httpx>=0.27.0,<1.0
+httpx2>=2.2.0,<3.0
+pgmpy==0.1.24
+PyJWT>=2.12.0,<3.0
+cryptography>=48.0.1,<49.0.0
+cffi>=2.0.0,<3.0
+structlog>=25.4.0,<26.0.0
+PyYAML>=6.0.1,<7.0
+# NetworkX 3.5+ requires Python >=3.10; allow older Python runtimes to use 3.2.x
+networkx>=3.5,<4.0; python_version >= "3.10"
+networkx>=3.2.1,<3.5; python_version < "3.10"
+apscheduler>=3.10,<4.0
+opentelemetry-sdk>=1.25,<2.0
+opentelemetry-exporter-otlp>=1.25,<2.0
+opentelemetry-instrumentation-fastapi>=0.46b0,<1.0
+scikit-learn>=1.3.0,<2.0
+bcrypt>=4.0.0,<5.0
+passlib[bcrypt]>=1.7.4,<2.0
+tenacity>=8.2.0,<9.0
+ssvc>=1.2.0,<2.0
+sarif-om>=1.0.4,<2.0
+python-dotenv>=1.0.0,<2.0
+sqlalchemy>=2.0.0,<3.0
+pyotp>=2.9.0,<3.0
+cvss>=3.6,<4.0
+defusedxml>=0.7.1,<1.0
+reportlab==4.4.10
+# Pin transitive Pillow (via reportlab) to close CVE-2026-40192 (FITS GZIP decompression bomb)
+pillow>=12.2.0,<13.0
+# Pin Pygments (transitive via pytest/ipython/rich) to close CVE-2026-4539 (ReDoS)
+pygments>=2.20.0,<3.0
+pytest>=9.0.3
+pytest-asyncio>=1.0.0,<2.0
+pytest-cov>=4.1.0,<6.0
+pytest-timeout>=2.2.0,<3.0
+aiohttp>=3.13.4,<4.0
+aiosqlite>=0.19.0,<1.0
+prometheus_client>=0.20.0,<1.0
+duckdb>=0.10.0
+sentence-transformers>=3.0.0
+# FEATURE-5: PostgreSQL backend for DBAdapter (DATABASE_URL=postgresql://...)
+# Optional at runtime — engines fall back to sqlite if unimportable.
+psycopg2-binary>=2.9,<3.0
+
+# 2026-05-03 night session: 5 INSTALL deps per docs/suite_core_install_retire_decisions_2026-05-03.md
+# Unlocks: GCP CSPM/SCC (3-cloud parity), LoRA distillation, real FIPS 204 PQ signing.
+# All 5 have existing try/except guards in suite-core that fall through to silent-empty
+# when missing — pinning is zero-risk; guards still permit absence in air-gapped builds.
+google-cloud-storage>=2.14
+google-cloud-securitycenter>=1.30
+google-auth>=2.27
+peft>=0.10
+dilithium-py>=1.0
+# Stripe SDK — real payment integration (Multica #4119)
+stripe>=7.0,<16.0
+
+# ---------------------------------------------------------------------------
+# Security-motivated dep pins (2026-06-01 hardening sweep)
+#
+# gitpython>=3.1.50 — closes CVE in ext:: transport (RCE); also defence-in-depth
+#   for the code_repo_agent.py input-validation fix.
+# urllib3>=2.7.0    — closes SSRF/redirect CVE (CVE-2025-50182 family)
+# idna>=3.15        — closes IDNA label-processing denial-of-service
+# mistune>=3.2.1    — closes ReDoS in Markdown parser
+# microsoft-kiota-http>=1.9.9 — closes auth-header leak on redirect
+# dulwich>=1.2.5    — closes path-traversal in pack file parsing
+# ---------------------------------------------------------------------------
+gitpython>=3.1.50,<4.0
+urllib3>=2.7.0,<3.0
+idna>=3.15,<4.0
+mistune>=3.2.1,<4.0
+microsoft-kiota-http>=1.9.9,<2.0
+dulwich>=1.2.5,<2.0
+
+# ---------------------------------------------------------------------------
+# Static call-graph / reachability parsers (SPEC-004 REQ-004-01)
+# tree-sitter core + language bindings for TS/JS, Java, Go.
+# These are local C extensions — zero network access at runtime (air-gap safe).
+# Exact versions pinned to match requirements.lock.
+# ---------------------------------------------------------------------------
+tree-sitter>=0.25.2,<0.26
+tree-sitter-typescript>=0.23.2,<0.24
+tree-sitter-java>=0.23.5,<0.24
+tree-sitter-go>=0.25.0,<0.26

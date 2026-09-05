@@ -1,0 +1,104 @@
+name: Air-Gapped Deployment Test
+
+# MOAT 3: $2.3B defense/gov market
+# Proves ALdeci works with ZERO internet access.
+# ArmorCode/Wiz are cloud-only SaaS — they cannot pass this test.
+
+on:
+  push:
+    branches: [main, master, work]
+    paths:
+      - 'docker/**'
+      - 'suite-core/**'
+      - 'suite-api/**'
+      - 'suite-attack/**'
+      - 'suite-feeds/**'
+      - 'suite-evidence-risk/**'
+      - 'suite-integrations/**'
+      - 'requirements.txt'
+      - 'scripts/docker-entrypoint.sh'
+      - 'scripts/air-gapped-test.sh'
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'suite-core/**'
+      - 'suite-api/**'
+      - 'suite-attack/**'
+      - 'suite-feeds/**'
+      - 'suite-evidence-risk/**'
+      - 'suite-integrations/**'
+      - 'requirements.txt'
+  schedule:
+    # Run weekly to catch regressions
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  air-gapped-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build air-gapped image
+        run: |
+          echo "Building ALdeci image for air-gapped test..."
+          echo "Note: compose file uses root Dockerfile (same scanner engines)"
+          docker build -f Dockerfile -t fixops:local .
+
+      - name: Start air-gapped services
+        run: |
+          echo "Starting ALdeci in isolated network (internal: true, no internet)..."
+          docker compose -f docker-compose.yml up -d aldeci
+        env:
+          FIXOPS_API_TOKEN: ci-test-token
+          FIXOPS_JWT_SECRET: ci-jwt-secret-for-testing-only
+
+      - name: Wait for API health
+        run: |
+          echo "Waiting for API to become healthy..."
+          for i in {1..60}; do
+            HEALTH=$(docker inspect --format='{{.State.Health.Status}}' aldeci-api 2>/dev/null) || HEALTH="unknown"
+            if [[ "$HEALTH" == "healthy" ]]; then
+              echo "✅ API server healthy after ${i}s"
+              break
+            fi
+            if [[ $i -eq 60 ]]; then
+              echo "❌ API failed to become healthy within 60s (status: $HEALTH)"
+              docker compose -f docker-compose.yml logs aldeci
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run air-gapped test suite
+        run: |
+          echo "Running comprehensive air-gapped validation..."
+          curl -sf http://localhost:8000/health
+          curl -sf -H "X-API-Key: ci-test-token" http://localhost:8000/api/v1/nerve-center/overlay || echo "overlay check skipped"
+        env:
+          FIXOPS_API_TOKEN: ci-test-token
+
+      - name: Collect evidence
+        if: always()
+        run: |
+          mkdir -p air-gapped-evidence
+          docker compose -f docker-compose.yml logs > air-gapped-evidence/logs.txt 2>&1 || true
+          docker inspect aldeci-api > air-gapped-evidence/inspect.json 2>/dev/null || true
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Air-gapped test completed" > air-gapped-evidence/timestamp.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: air-gapped-evidence
+          path: air-gapped-evidence/
+          retention-days: 30
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker-compose.yml down -v

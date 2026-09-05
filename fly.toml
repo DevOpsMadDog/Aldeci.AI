@@ -1,0 +1,69 @@
+## ALDECI CTEM+ — Fly.io deployment config
+## Generated 2026-05-09
+## Deploy: flyctl launch --copy-config --no-deploy  (first time)
+##         flyctl secrets set FIXOPS_API_TOKEN=... FIXOPS_JWT_SECRET=... ANTHROPIC_API_KEY=... OPENROUTER_API_KEY=...
+##         flyctl volumes create aldeci_data --size 10 --region syd
+##         flyctl deploy --remote-only
+## URL:    https://<app-name>.fly.dev
+## Custom domain: flyctl certs create aldeci.example.com
+
+app = "aldeci"
+primary_region = "syd"  # Sydney — change to nearest paid region (iad, ord, fra, etc.)
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  FIXOPS_MODE = "enterprise"
+  FIXOPS_DISABLE_RATE_LIMIT = "0"
+  FIXOPS_USE_COUNCIL = "1"
+  # 0 — the deployed instance must never fabricate data. Note this flag is read by
+  # docker/docker-entrypoint.sh, NOT by scripts/docker-entrypoint.sh which is the
+  # image ENTRYPOINT, so it was already inert here. Set explicitly so the config
+  # cannot be misread as "production seeds demo data".
+  ALDECI_SEED_DEMO = "0"
+  PORT = "8000"
+  PYTHONUNBUFFERED = "1"
+
+[[mounts]]
+  source = "aldeci_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"   # heavy ~5min cold start — keep warm, never stop (boot-perf debt #9021)
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 200
+    soft_limit = 150
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "15s"
+  grace_period = "360s"   # app boots in ~5min (heavy route graph) — give fly time before marking critical
+  method = "GET"
+  path = "/api/v1/health"
+  protocol = "http"
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 1
+  size = "shared-cpu-1x"
+
+[[restart]]
+  policy = "on-failure"
+  retries = 3
+
+[deploy]
+  strategy = "rolling"
+  # Seed demo data manually after first deploy:
+  #   flyctl ssh console --app aldeci -C "python scripts/seed_demo_data.py"
+  # (scripts/ is not in the runtime image by default; mount or rebuild with COPY scripts/)

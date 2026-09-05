@@ -1,0 +1,346 @@
+"""
+FixOps Decision & Verification API Endpoints
+Provides decision engine operations and metrics
+"""
+
+import time
+from typing import Any, Dict, List, Optional
+
+import structlog
+from apps.api.dependencies import get_org_id
+from core.db.enterprise.session import DatabaseManager
+from core.enterprise.security import get_current_user
+from core.services.enterprise.decision_engine import DecisionContext, decision_engine
+from core.services.enterprise.metrics import FixOpsMetrics
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+
+logger = structlog.get_logger()
+router = APIRouter(prefix="/decisions", tags=["decision-engine"])
+
+
+class DecisionRequest(BaseModel):
+    service_name: str = "unknown-service"
+    environment: str = "production"
+    business_context: Dict[str, Any] = {}
+    security_findings: List[Dict[str, Any]] = []
+    sbom_data: Optional[Dict[str, Any]] = None
+    threat_model: Optional[Dict[str, Any]] = None
+
+
+class DecisionResponse(BaseModel):
+    decision: str
+    confidence_score: float
+    evidence_id: str
+    reasoning: str
+    processing_time_us: float
+    consensus_details: Dict[str, Any]
+    validation_results: Dict[str, Any]
+
+
+@router.post("/make-decision", response_model=DecisionResponse)
+async def make_security_decision(request: DecisionRequest, org_id: str = Depends(get_org_id)):
+    """
+    Make a security decision based on context and intelligence
+    Core FixOps Decision & Verification Engine endpoint
+    """
+    try:
+        context = DecisionContext(
+            service_name=request.service_name,
+            environment=request.environment,
+            business_context=request.business_context,
+            security_findings=request.security_findings,
+            sbom_data=request.sbom_data,
+            threat_model=request.threat_model,
+        )
+
+        result = await decision_engine.make_decision(context)
+
+        response = DecisionResponse(
+            decision=result.decision.value,
+            confidence_score=result.confidence_score,
+            evidence_id=result.evidence_id,
+            reasoning=result.reasoning,
+            processing_time_us=result.processing_time_us,
+            consensus_details=result.consensus_details,
+            validation_results=result.validation_results,
+        )
+
+        FixOpsMetrics.record_decision(
+            verdict=result.decision.value,
+            confidence=result.confidence_score,
+            duration_seconds=result.processing_time_us / 1_000_000,
+        )
+
+        return response
+
+    except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+        logger.error("Decision making failed: %s", type(e).__name__)
+        FixOpsMetrics.record_decision_error(reason="exception")
+        raise HTTPException(status_code=500, detail="Decision engine error")
+
+
+@router.get("/metrics")
+async def get_decision_metrics(org_id: str = Depends(get_org_id)):
+    """Get decision engine performance metrics and status"""
+    try:
+        metrics = await decision_engine.get_decision_metrics()
+        return {"status": "success", "data": metrics}
+
+    except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+        logger.error("Failed to get decision metrics: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to get decision metrics")
+
+
+@router.get("/recent")
+async def get_recent_decisions(org_id: str = Depends(get_org_id), limit: int = Query(default=10, ge=1, le=50)):
+    """Get recent pipeline decisions with full context"""
+    try:
+        if not hasattr(decision_engine, "get_recent_decisions"):
+            return {"status": "success", "data": [], "note": "decision_engine.get_recent_decisions not available"}
+        decisions = await decision_engine.get_recent_decisions(limit)
+        return {"status": "success", "data": decisions}
+
+    except (OSError, ValueError, KeyError, RuntimeError, AttributeError, NotImplementedError) as e:
+        logger.error("Failed to get recent decisions: %s", type(e).__name__)
+        return {"status": "degraded", "data": [], "error": str(e)}
+
+
+@router.get("/ssdlc-stages")
+async def get_ssdlc_stage_data(org_id: str = Depends(get_org_id)):
+    """Get SSDLC stage data ingestion status.
+
+    Was ``Depends(get_current_user)`` — the enterprise verifier, which requires
+    ``iss: fixops-enterprise`` and ``aud: fixops-api``. Nothing in the product
+    mints those claims: ``SecurityManager.create_access_token``, the only
+    function that sets them, has **zero call sites**, and the login endpoint
+    uses a different minter. So this route answered 401 to every credential
+    that exists, including a valid login, and had done since it was written.
+
+    The 401 was not even honest — the token was fine; the verifier could not be
+    satisfied by any token. It also masked a 500 (see the PyJWT commit): the
+    ``except`` meant to convert the rejection into a 401 named an attribute
+    PyJWT does not have.
+
+    The route is still authenticated. Every path under ``/api/v1/decisions`` is
+    gated by middleware ("Invalid or missing API token"), verified by probing
+    all five routes with no credential. ``get_current_user`` was a redundant
+    second gate, so removing it changes nothing about who may call this — only
+    whether anyone *can*. Confirmed unauthenticated is still 401 after the swap.
+    """
+    try:
+        stage_data = await decision_engine.get_ssdlc_stage_data()
+        # "scope" is not decoration. These counts come from the enterprise
+        # models (services, security_findings, policy_decision_logs), which
+        # carry no org_id column anywhere — the whole set is single-tenant — so
+        # they are deployment-wide totals and cannot be filtered to the caller.
+        # Labelling them is the difference between an honest aggregate and the
+        # copilot defect, where another tenant's numbers were handed back as
+        # the caller's own. A consumer that needs per-org figures must not read
+        # these.
+        return {"status": "success", "data": stage_data, "scope": "deployment-wide"}
+
+    except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+        logger.error("Failed to get SSDLC stage data: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to get SSDLC stage data")
+
+
+@router.get("/core-components")
+async def get_core_components_status(org_id: str = Depends(get_org_id)):
+    """Decision & Verification Core component status.
+
+    Unreachable for the same reason as ``/ssdlc-stages`` above; same fix, same
+    middleware auth still in force.
+
+    Returns component health (vector DB, LLM configuration, consensus
+    algorithm), not tenant records. The one aggregate it reports — the
+    ``policy_decision_logs`` row count — is deliberately left unscoped because
+    it is a system-health signal, but note it is a global count: when the
+    decision engine learns about tenants (``DecisionContext`` has no org field
+    today) this should be scoped with it.
+    """
+    try:
+        # Get real component status
+        components = {}
+
+        # Real Vector DB status
+        if hasattr(decision_engine, "real_vector_db_stats"):
+            vector_stats = decision_engine.real_vector_db_stats
+            components["vector_db"] = {
+                "status": "production_active"
+                if vector_stats.get("connection_status") == "connected"
+                else "error",
+                "type": vector_stats.get("type", "ChromaDB"),
+                "patterns_loaded": vector_stats.get("patterns_loaded", False),
+                "search_functional": vector_stats.get("test_search_successful", False),
+            }
+        else:
+            components["vector_db"] = {
+                "status": "not_initialized",
+                "type": "ChromaDB",
+            }
+
+        # Real LLM integration status
+        components["llm_rag"] = {
+            "status": "production_active"
+            if decision_engine.chatgpt_client
+            else "not_configured",
+            "model": "ChatGPT" if decision_engine.chatgpt_client else "not_available",
+            "integration_type": "OpenAI ChatGPT",
+        }
+
+        # Real consensus checker status
+        components["consensus_checker"] = {
+            "status": "production_active",
+            "algorithm": "weighted_consensus",
+            "threshold": 0.85,
+            "components_integrated": [
+                "vector_db",
+                "policy_engine",
+                "golden_regression",
+            ],
+        }
+
+        # Real golden regression using database
+        async with DatabaseManager.get_session_context() as session:
+            from sqlalchemy import text
+
+            # Count real policy decisions for validation
+            result = await session.execute(
+                text("SELECT COUNT(*) FROM policy_decision_logs")
+            )
+            decision_count = result.scalar() or 0
+
+            components["golden_regression"] = {
+                "status": "production_active",
+                "real_cases": decision_count,
+                "data_source": "policy_decision_logs",
+                "validation_method": "historical_decisions",
+            }
+
+        # Real policy engine status
+        from core.services.enterprise.real_opa_engine import get_opa_engine
+
+        opa_engine = await get_opa_engine()
+        opa_healthy = await opa_engine.health_check()
+
+        components["policy_engine"] = {
+            "status": "production_active" if opa_healthy else "opa_unavailable",
+            "type": "Production OPA Engine",
+            "opa_server_healthy": opa_healthy,
+            "policies_loaded": ["vulnerability", "sbom"],
+        }
+
+        # Real SBOM injection status
+        components["sbom_injection"] = {
+            "status": "production_active",
+            "library": "lib4sbom",
+            "criticality_assessment": "enabled",
+            "metadata_sources": ["Real CycloneDX SBOM", "Real Component Analysis"],
+        }
+
+        # Add system-wide metrics
+        components["system_info"] = {
+            "mode": "production",
+            "processing_layer_available": decision_engine.processing_layer is not None,
+            "oss_integrations_available": decision_engine.oss_integrations is not None,
+        }
+
+        # Deployment-wide for the same reason as /ssdlc-stages: golden_regression
+        # counts every row in policy_decision_logs, a table with no tenant column.
+        return {"status": "success", "data": components, "scope": "deployment-wide"}
+
+    except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+        logger.error("Failed to get core components status: %s", type(e).__name__)
+        # Return error status but don't fail completely
+        return {
+            "status": "error",
+            "error": "Failed to get core components status",
+            "data": {"system_info": {"mode": "error"}},
+        }
+
+
+@router.get("/evidence/{evidence_id}")
+async def get_evidence_record(
+    evidence_id: str, current_user: Dict = Depends(get_current_user)
+):
+    """Get immutable evidence record from Evidence Lake.
+
+    DELIBERATELY LEFT ON THE UNSATISFIABLE GATE — do not "fix" this the way the
+    two routes above were fixed without doing the work described here first.
+
+    It is unreachable for the same reason they were, but it is the one route in
+    this file that returns tenant data, and it cannot currently be scoped:
+
+    * ``EvidenceLake.retrieve_evidence`` selects from ``user_audit_logs`` by
+      ``resource_id`` alone — no tenant predicate.
+    * The stored record has no tenant to filter on. ``DecisionContext`` carries
+      ``service_name`` and ``environment`` but no ``org_id``, and
+      ``make_security_decision`` resolves ``org_id`` and then does not pass it
+      in, so every evidence record ever written is untagged.
+
+    Swapping the dependency here would convert a route nobody can reach into an
+    authenticated cross-tenant read of any evidence id — trading a 401 for a
+    data leak. The prerequisite is to thread ``org_id`` into ``DecisionContext``
+    and the evidence record, then filter on it at retrieval and refuse untagged
+    legacy records to a tenant-pinned caller.
+    """
+    start_time = time.perf_counter()
+    source = "none"
+
+    try:
+        # Try Evidence Lake first
+        from core.services.enterprise.evidence_lake import EvidenceLake
+
+        evidence = await EvidenceLake.retrieve_evidence(evidence_id)
+
+        if evidence:
+            source = "lake"
+            FixOpsMetrics.record_evidence_request(
+                source=source,
+                status="hit",
+                duration_seconds=time.perf_counter() - start_time,
+            )
+            return {
+                "status": "success",
+                "data": evidence,
+                "source": "evidence_lake",
+            }
+
+        # Fallback to cache if not found in Evidence Lake
+        from core.services.enterprise.cache_service import CacheService
+
+        cache = CacheService.get_instance()
+
+        cached_evidence = await cache.get(f"evidence:{evidence_id}")
+        if cached_evidence:
+            source = "cache"
+            if isinstance(cached_evidence, str):
+                import json
+
+                cached_evidence = json.loads(cached_evidence)
+            FixOpsMetrics.record_evidence_request(
+                source=source,
+                status="hit",
+                duration_seconds=time.perf_counter() - start_time,
+            )
+            return {"status": "success", "data": cached_evidence, "source": "cache"}
+
+        # Not found in either location
+        FixOpsMetrics.record_evidence_request(
+            source=source,
+            status="miss",
+            duration_seconds=time.perf_counter() - start_time,
+        )
+        raise HTTPException(status_code=404, detail="Evidence record not found")
+
+    except HTTPException:
+        raise
+    except (OSError, ValueError, KeyError, RuntimeError) as e:  # narrowed from bare Exception
+        logger.error("Failed to get evidence record: %s", type(e).__name__)
+        FixOpsMetrics.record_evidence_request(
+            source=source or "unknown",
+            status="error",
+            duration_seconds=time.perf_counter() - start_time,
+        )
+        raise HTTPException(status_code=500, detail="Failed to retrieve evidence record")

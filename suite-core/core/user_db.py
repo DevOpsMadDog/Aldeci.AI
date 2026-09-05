@@ -1,0 +1,480 @@
+"""
+User and team database manager using SQLite.
+"""
+import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import bcrypt
+
+from core.user_models import Team, TeamMember, User, UserRole, UserStatus
+
+
+def default_user_db_path() -> Path:
+    """Where the user database lives, independent of the process's cwd.
+
+    The default was the RELATIVE string "data/users.db", so which user database
+    you opened depended on where you happened to start the process. Measured on
+    this repo:
+
+        ./data/users.db            79 users
+        ./suite-api/data/users.db   0 users
+
+    Anything started from suite-api/ therefore authenticated against an EMPTY
+    database — every login 401s and every signup writes into a file nothing else
+    reads. That is precisely how "the password hash verifies in-process but
+    login returns 401" happens, and it cost a debugging session before anyone
+    looked at the path.
+
+    Same defect as the advisory-body lookup reading the wrong feeds.db and the
+    call graph landing outside the data directory: a relative path is a join
+    whose other half is the working directory.
+
+    FIXOPS_USERS_DB overrides for deployments that place it elsewhere. The
+    fallback stays <repo>/data/users.db rather than FIXOPS_DATA_DIR — moving it
+    would orphan the 79 accounts already there, and this change is about cwd,
+    not relocation.
+    """
+    configured = os.environ.get("FIXOPS_USERS_DB", "").strip()
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parents[2] / "data" / "users.db"
+
+
+class UserDB:
+    """Database manager for users and teams."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        """Initialize database connection."""
+        self.db_path = Path(db_path) if db_path else default_user_db_path()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_tables()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get database connection."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_tables(self):
+        """Initialize database tables."""
+        conn = self._get_connection()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    first_name TEXT NOT NULL,
+                    last_name TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    department TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login_at TEXT,
+                    org_id TEXT NOT NULL DEFAULT 'default'
+                );
+
+                CREATE TABLE IF NOT EXISTS teams (
+                    id TEXT PRIMARY KEY,
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS team_members (
+                    team_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (team_id, user_id),
+                    FOREIGN KEY (team_id) REFERENCES teams(id),
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+                CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+                CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id);
+                CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id);
+            """
+            )
+            conn.commit()
+
+            # Schema migration: users.org_id.
+            #
+            # teams got this treatment; users never did. Signup derives a
+            # per-user org and mints an org-scoped API key against it, but with
+            # nowhere to persist it, login read getattr(user, "org_id", "default")
+            # and always got "default" — so the SAME account resolved to its own
+            # tenant by API key and to the shared default tenant by password.
+            # list_users(org_id=...) then had no column to filter on and returned
+            # every user in every org.
+            ucols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "org_id" not in ucols:
+                import logging as _lu
+                _lu.getLogger(__name__).warning(
+                    "LEGACY DB DETECTED: users.org_id missing — adding column and backfilling to 'default'"
+                )
+                conn.execute("ALTER TABLE users ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default'")
+                conn.execute("UPDATE users SET org_id = 'default' WHERE org_id IS NULL OR org_id = ''")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_users_org_id ON users(org_id)")
+                conn.commit()
+
+            # Schema migration: ensure org_id column exists on teams, backfill, and index.
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(teams)").fetchall()}
+            if "org_id" not in cols:
+                import logging as _l
+                _l.getLogger(__name__).warning(
+                    "LEGACY DB DETECTED: teams.org_id missing — adding column and backfilling to 'default'"
+                )
+                conn.execute("ALTER TABLE teams ADD COLUMN org_id TEXT NOT NULL DEFAULT 'default'")
+                conn.execute("UPDATE teams SET org_id = 'default' WHERE org_id IS NULL OR org_id = ''")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_teams_org_id ON teams(org_id)")
+                conn.commit()
+        finally:
+            conn.close()
+
+    def hash_password(self, password: str) -> str:
+        """Hash password using bcrypt."""
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    def verify_password(self, password: str, password_hash: str) -> bool:
+        """Verify password against hash."""
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+
+    def create_user(self, user: User) -> User:
+        """Create new user."""
+        if not user.id:
+            user.id = str(uuid.uuid4())
+        conn = self._get_connection()
+        try:
+            # Columns named explicitly. A bare INSERT INTO users VALUES (...)
+            # binds by position, so ALTER TABLE ... ADD COLUMN silently shifts
+            # every value one place left the next time the schema grows.
+            conn.execute(
+                """INSERT INTO users (
+                       id, email, password_hash, first_name, last_name,
+                       role, status, department, created_at, updated_at,
+                       last_login_at, org_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user.id,
+                    user.email,
+                    user.password_hash,
+                    user.first_name,
+                    user.last_name,
+                    user.role.value,
+                    user.status.value,
+                    user.department,
+                    user.created_at.isoformat(),
+                    user.updated_at.isoformat(),
+                    user.last_login_at.isoformat() if user.last_login_at else None,
+                    user.org_id or "default",
+                ),
+            )
+            conn.commit()
+            return user
+        finally:
+            conn.close()
+
+    def get_user(self, user_id: str) -> Optional[User]:
+        """Get user by ID."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if row:
+                return self._row_to_user(row)
+            return None
+        finally:
+            conn.close()
+
+    def get_user_by_email(self, email: str) -> Optional[User]:
+        """Get user by email."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            if row:
+                return self._row_to_user(row)
+            return None
+        finally:
+            conn.close()
+
+    def list_users(self, org_id: Optional[str] = None, limit: int = 100, offset: int = 0) -> List[User]:
+        """List users with pagination, optionally filtered by org_id."""
+        conn = self._get_connection()
+        try:
+            # Graceful: check if org_id column exists
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if org_id is not None:
+                # Fail CLOSED. This previously logged "org_id column missing"
+                # and then returned every user in every org — the caller asked
+                # to be scoped to one tenant and silently got all of them.
+                # _init_tables migrates the column in, so its absence here is a
+                # bug, not a condition to degrade around.
+                if "org_id" not in cols:
+                    raise RuntimeError(
+                        "users.org_id column missing — refusing to list users "
+                        "unscoped when an org_id was requested"
+                    )
+                rows = conn.execute(
+                    "SELECT * FROM users WHERE org_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (org_id, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+            return [self._row_to_user(row) for row in rows]
+        finally:
+            conn.close()
+
+    def count_users(self, org_id: Optional[str] = None) -> int:
+        """Return total count of users, optionally scoped to org_id."""
+        conn = self._get_connection()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if org_id is not None:
+                # Same fail-closed rule as list_users: a scoped count that
+                # quietly counts every tenant is worse than an error.
+                if "org_id" not in cols:
+                    raise RuntimeError(
+                        "users.org_id column missing — refusing to count users "
+                        "unscoped when an org_id was requested"
+                    )
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM users WHERE org_id = ?", (org_id,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def update_user(self, user: User) -> User:
+        """Update user."""
+        user.updated_at = datetime.now(timezone.utc)
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """UPDATE users SET email=?, password_hash=?, first_name=?, last_name=?,
+                   role=?, status=?, department=?, updated_at=?, last_login_at=?,
+                   org_id=?
+                   WHERE id=?""",
+                (
+                    user.email,
+                    user.password_hash,
+                    user.first_name,
+                    user.last_name,
+                    user.role.value,
+                    user.status.value,
+                    user.department,
+                    user.updated_at.isoformat(),
+                    user.last_login_at.isoformat() if user.last_login_at else None,
+                    user.org_id or "default",
+                    user.id,
+                ),
+            )
+            conn.commit()
+            return user
+        finally:
+            conn.close()
+
+    def delete_user(self, user_id: str) -> bool:
+        """Delete user."""
+        conn = self._get_connection()
+        try:
+            conn.execute("DELETE FROM team_members WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def create_team(self, team: Team, org_id: str = "default") -> Team:
+        """Create new team."""
+        if not team.id:
+            team.id = str(uuid.uuid4())
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO teams (id, name, description, created_at, updated_at, org_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    team.id,
+                    team.name,
+                    team.description,
+                    team.created_at.isoformat(),
+                    team.updated_at.isoformat(),
+                    org_id,
+                ),
+            )
+            conn.commit()
+            return team
+        finally:
+            conn.close()
+
+    def get_team(self, team_id: str, org_id: Optional[str] = None) -> Optional[Team]:
+        """Get team by ID. If org_id is provided, enforces ownership."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM teams WHERE id = ?", (team_id,)
+            ).fetchone()
+            if not row:
+                return None
+            if org_id is not None:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(teams)").fetchall()}
+                if "org_id" not in cols:
+                    import logging as _l
+                    _l.getLogger(__name__).warning(
+                        "LEGACY DB DETECTED: teams.org_id missing — returning None for safety"
+                    )
+                    return None
+                if row["org_id"] != org_id:
+                    return None
+            return self._row_to_team(row)
+        finally:
+            conn.close()
+
+    def list_teams(self, org_id: Optional[str] = None, limit: int = 100, offset: int = 0) -> List[Team]:
+        """List teams with pagination, optionally filtered by org_id."""
+        conn = self._get_connection()
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(teams)").fetchall()}
+            if org_id is not None and "org_id" in cols:
+                rows = conn.execute(
+                    "SELECT * FROM teams WHERE org_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (org_id, limit, offset),
+                ).fetchall()
+            else:
+                if org_id is not None and "org_id" not in cols:
+                    import logging as _l
+                    _l.getLogger(__name__).warning(
+                        "LEGACY DB DETECTED: teams.org_id missing — returning empty for safety, run migration"
+                    )
+                    return []
+                rows = conn.execute(
+                    "SELECT * FROM teams ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+            return [self._row_to_team(row) for row in rows]
+        finally:
+            conn.close()
+
+    def update_team(self, team: Team) -> Team:
+        """Update team."""
+        team.updated_at = datetime.now(timezone.utc)
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """UPDATE teams SET name=?, description=?, updated_at=? WHERE id=?""",
+                (team.name, team.description, team.updated_at.isoformat(), team.id),
+            )
+            conn.commit()
+            return team
+        finally:
+            conn.close()
+
+    def delete_team(self, team_id: str) -> bool:
+        """Delete team."""
+        conn = self._get_connection()
+        try:
+            conn.execute("DELETE FROM team_members WHERE team_id = ?", (team_id,))
+            conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def add_team_member(
+        self, team_id: str, user_id: str, role: str = "member"
+    ) -> TeamMember:
+        """Add user to team."""
+        member = TeamMember(team_id=team_id, user_id=user_id, role=role)
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                """INSERT INTO team_members VALUES (?, ?, ?, ?)""",
+                (team_id, user_id, role, member.added_at.isoformat()),
+            )
+            conn.commit()
+            return member
+        finally:
+            conn.close()
+
+    def remove_team_member(self, team_id: str, user_id: str) -> bool:
+        """Remove user from team."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "DELETE FROM team_members WHERE team_id = ? AND user_id = ?",
+                (team_id, user_id),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def list_team_members(self, team_id: str) -> List[Dict[str, Any]]:
+        """List all members of a team with user details."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                """SELECT u.*, tm.role as team_role, tm.added_at
+                   FROM team_members tm
+                   JOIN users u ON tm.user_id = u.id
+                   WHERE tm.team_id = ?""",
+                (team_id,),
+            ).fetchall()
+            return [
+                {
+                    **self._row_to_user(row).to_dict(),
+                    "team_role": row["team_role"],
+                    "added_at": row["added_at"],
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def _row_to_user(self, row) -> User:
+        """Convert database row to User object."""
+        return User(
+            id=row["id"],
+            email=row["email"],
+            password_hash=row["password_hash"],
+            first_name=row["first_name"],
+            last_name=row["last_name"],
+            role=UserRole(row["role"]),
+            status=UserStatus(row["status"]),
+            org_id=(row["org_id"] if "org_id" in row.keys() else "default") or "default",
+            department=row["department"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            last_login_at=(
+                datetime.fromisoformat(row["last_login_at"])
+                if row["last_login_at"]
+                else None
+            ),
+        )
+
+    def _row_to_team(self, row) -> Team:
+        """Convert database row to Team object."""
+        return Team(
+            id=row["id"],
+            name=row["name"],
+            description=row["description"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
