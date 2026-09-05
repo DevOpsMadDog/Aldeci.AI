@@ -290,6 +290,70 @@ def _attach_vulnerable_symbols(findings_dicts: List[Dict]) -> int:
     return enriched
 
 
+def _score_findings_for_exposure(
+    findings_dicts: List[Dict[str, Any]],
+    org_id: str,
+) -> int:
+    """Score ingested findings into the exposure store for this org.
+
+    Nothing connected ingest to the exposure store, so a tenant that had just
+    uploaded a scan saw two numbers disagree on one dashboard:
+
+        GET /api/v1/security-findings/          2 findings
+        GET /api/v1/risk-scoring/exposure/org   0 open findings, "minimal"
+
+    calculate_org_exposure now answers "unassessed" rather than inventing
+    "minimal risk", which is honest but still not useful — the tenant HAS
+    findings and they are scoreable. This is the wiring that makes the
+    exposure number real.
+
+    Best-effort, exactly like the two bridges beside it: an ingest must not
+    fail because scoring did. A failure here leaves the org unassessed, which
+    is the truthful fallback rather than a wrong number.
+
+    Returns the count scored, which the upload response reports, so a caller
+    can see it happened instead of assuming it.
+    """
+    if not findings_dicts:
+        return 0
+    try:
+        from core.exposure_scorer import get_exposure_scorer
+        from core.risk_prioritizer import get_risk_prioritizer
+    except ImportError:
+        logger.warning("exposure scoring skipped — scorer unavailable")
+        return 0
+
+    try:
+        prioritizer = get_risk_prioritizer()
+        scores: List[Dict[str, Any]] = []
+        for finding in findings_dicts:
+            try:
+                result = prioritizer.score_finding(finding)
+            except Exception:  # noqa: BLE001 - one bad finding must not stop the rest
+                logger.debug("scoring failed for one finding", exc_info=True)
+                continue
+            scores.append({
+                "finding_id": str(
+                    finding.get("id")
+                    or finding.get("finding_id")
+                    or getattr(result, "finding_id", "")
+                ),
+                "composite_score": float(getattr(result, "composite_score", 0.0)),
+                "asset_id": str(
+                    finding.get("asset_id") or finding.get("app_id") or "unknown"
+                ),
+                "status": "open",
+            })
+        if not scores:
+            return 0
+        get_exposure_scorer().ingest_scores(scores, org_id=org_id)
+        return len(scores)
+    except Exception:  # noqa: BLE001 - never break ingest
+        logger.warning("exposure scoring failed for org %s", org_id, exc_info=True)
+        return 0
+
+
+
 def _promote_findings_to_issues(
     findings_dicts: List[Dict[str, Any]],
     scanner: str,
@@ -732,6 +796,11 @@ async def upload_scanner_output(
     # the LLM council can enrich them.  Best-effort — never blocks the response.
     brain_index_result = _index_findings_into_brain(canonical_dicts, org_id)
 
+    # Bridge: score into the exposure store so /risk-scoring/exposure/org
+    # reflects what was just ingested, instead of reporting the tenant as
+    # unassessed while the Findings screen shows rows.
+    exposure_scored = _score_findings_for_exposure(canonical_dicts, org_id)
+
     # SPEC-017: optionally auto-run the full Brain Pipeline (non-blocking, config-gated,
     # bounded, air-gap-safe). Default OFF — unchanged unless FIXOPS_PIPELINE_ON_INGEST set.
     from apps.api.pipeline_on_ingest import dispatch_pipeline_on_ingest
@@ -889,6 +958,11 @@ async def webhook_ingest(
     # Bridge: index findings into Store B (KnowledgeBrain) so BrainCorrelator /
     # the LLM council can enrich them.  Best-effort — never blocks the response.
     brain_index_result = _index_findings_into_brain(canonical_dicts, org_id)
+
+    # Bridge: score into the exposure store so /risk-scoring/exposure/org
+    # reflects what was just ingested, instead of reporting the tenant as
+    # unassessed while the Findings screen shows rows.
+    exposure_scored = _score_findings_for_exposure(canonical_dicts, org_id)
 
     # SPEC-017: non-blocking, config-gated auto-run of the full Brain Pipeline (default OFF).
     from apps.api.pipeline_on_ingest import dispatch_pipeline_on_ingest
