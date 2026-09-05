@@ -48,7 +48,7 @@ jobs:
             --source-uri "${{ github.server_url }}/${{ github.repository }}@${{ github.sha }}" \
             --build-type "https://github.com/actions/runner"
       - name: Upload provenance attestation
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: provenance-attestations
           path: artifacts/attestations/

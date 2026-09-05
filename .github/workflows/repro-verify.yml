@@ -35,7 +35,7 @@ jobs:
             --out artifacts/repro/attestations \
             --repo .
       - name: Upload reproducibility attestations
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: repro-attestations
           path: artifacts/repro/attestations/

@@ -98,7 +98,7 @@ jobs:
         continue-on-error: true
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: |
@@ -454,7 +454,7 @@ jobs:
 
       - name: Upload health check results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: healthcheck-results
           path: healthcheck-results.json
@@ -512,7 +512,7 @@ jobs:
         continue-on-error: true
       - name: Upload audit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pip-audit-report
           path: pip-audit-results.json
@@ -666,7 +666,7 @@ jobs:
             exit 1
           fi
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aldeci-ui-dist
           path: suite-ui/aldeci-ui-new/dist/
