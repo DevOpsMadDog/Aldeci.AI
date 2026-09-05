@@ -90,7 +90,11 @@ def fetch_feed(name: str, config: dict) -> bool:
         print(f"✗ HTTP Error {e.code}: {e.reason}")
         if e.code == 404:
             print(
-                "  Note: NVD feed URLs may have changed. Check https://nvd.nist.gov/vuln/data-feeds"
+                "  Note: the NVD 1.1 JSON feeds above are RETIRED by NIST and answer "
+                "403 — measured 2026-09-05. Use the NVD 2.0 API "
+                "(https://services.nvd.nist.gov/rest/json/cves/2.0) with an API key. "
+                "KEV and EPSS above are unaffected and are what the exploit "
+                "intelligence actually needs."
             )
         return False
     except URLError as e:
