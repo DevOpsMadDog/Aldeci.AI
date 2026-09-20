@@ -3,7 +3,7 @@
 # httpx2>=2.2.0 is required by starlette 1.x TestClient (replaces httpx in test transport).
 # httpx is kept for runtime HTTP calls (connectors, feeds, etc.) — starlette's testclient
 # now imports httpx2 first so no StarletteDeprecationWarning fires at test collection.
-fastapi>=0.133,<0.137
+fastapi>=0.141.1,<0.142
 starlette>=1.0.1,<2.0
 uvicorn>=0.30.0,<1.0
 pydantic>=2.6,<3.0
