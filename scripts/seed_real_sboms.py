@@ -20,7 +20,7 @@ from typing import Iterable
 API = "http://localhost:8000"
 KEY = os.environ.get(
     "FIXOPS_API_KEY",
-    "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_",
+    "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN",
 )
 FLEET = Path("/tmp/fixops-fleet")
 

@@ -20,7 +20,7 @@ import { test, expect, type Page, type Request } from "@playwright/test";
 const API_BASE = process.env.VITE_API_URL || "http://localhost:8000";
 const API_TOKEN =
   process.env.FIXOPS_API_TOKEN ||
-  "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_";
+  "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN";
 const ORG_ID = "verify-test";
 
 /** Inject API key + org_id into localStorage so apiFetch helpers pick them up. */

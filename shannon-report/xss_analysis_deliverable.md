@@ -90,7 +90,7 @@ A secondary middleware exists at `suite-core/core/enterprise/middleware.py` with
 
 During live testing, an enterprise API key was found in a script committed to the repository (`scripts/live_app_test.py`):
 ```
-fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_
+fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN
 ```
 This key was used to confirm all three live-tested XSS vulnerabilities. The exploitation phase can use this credential to create malicious reports and share export URLs with victim users.
 

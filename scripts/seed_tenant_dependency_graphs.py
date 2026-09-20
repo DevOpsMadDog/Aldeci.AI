@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 API_BASE = os.environ.get("FIXOPS_API_BASE", "http://127.0.0.1:8000")
 API_KEY = os.environ.get(
     "FIXOPS_API_TOKEN",
-    "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_",
+    "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN",
 )
 FLEET_ROOT = Path(os.environ.get("FIXOPS_FLEET_ROOT", "/tmp/fixops-fleet"))
 

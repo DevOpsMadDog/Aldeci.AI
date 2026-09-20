@@ -51,7 +51,7 @@ API_TOKEN = (
     os.environ.get("API_TOKEN")
     or os.environ.get("FIXOPS_API_TOKEN")
     or _dotenv.get("FIXOPS_API_TOKEN")
-    or "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+    or "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 )
 ORG_ID = "aldeci-demo"
 

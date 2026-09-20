@@ -40,7 +40,7 @@ set -uo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────
 API="http://localhost:8000"
-KEY="${FIXOPS_API_KEY:-fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_}"
+KEY="${FIXOPS_API_KEY:-fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN}"
 FLEET_DIR="/tmp/fixops-fleet"
 LOG="/tmp/onboard-real-apps.log"
 RESULT_JSON="/tmp/fleet-tenants.json"

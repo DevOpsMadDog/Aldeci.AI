@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 
 BASE = os.getenv("ALDECI_BASE_URL", "http://localhost:8000")
-API_KEY = os.getenv("FIXOPS_API_TOKEN", os.getenv("API_KEY", "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"))
+API_KEY = os.getenv("FIXOPS_API_TOKEN", os.getenv("API_KEY", "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"))
 H = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 JUICE_SHOP = Path("/tmp/juiceshop-test")
 OUT = Path("/tmp/aldeci_e2e_results")

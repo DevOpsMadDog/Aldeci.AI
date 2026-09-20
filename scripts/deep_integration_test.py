@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 BASE_URL = "http://localhost:8000"
-API_KEY = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_KEY = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ORG_ID = "deep-test"
 DELAY = 1.2  # seconds between requests (some engines enforce 1 req/s rate limit)
 

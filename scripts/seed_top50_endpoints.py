@@ -13,7 +13,7 @@ import urllib.error
 from typing import Any, Dict, Optional
 
 BASE = "http://localhost:8000"
-TOKEN = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+TOKEN = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ORG = "default"
 SLEEP = 1.4   # seconds between POSTs to stay under 50 RPM write limit
 

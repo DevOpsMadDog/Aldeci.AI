@@ -24,7 +24,7 @@ Exercises the complete ALDECI intelligence pipeline against a live server:
  20.  Brain stats growth after ingest
 
 Server: http://localhost:8000
-Token:  fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_
+Token:  fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN
 
 Compliance: SOC2 CC7.2 (monitoring), CC3.1 (risk assessment)
 
@@ -54,7 +54,7 @@ import requests
 # ---------------------------------------------------------------------------
 
 BASE_URL = "http://localhost:8000"
-TOKEN = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+TOKEN = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 HEADERS = {"X-API-Key": TOKEN, "Content-Type": "application/json"}
 ORG_ID = "e2e-test-org"
 TIMEOUT = 15  # seconds per request

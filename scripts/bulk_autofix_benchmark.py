@@ -4,7 +4,7 @@ import json
 import urllib.request
 
 API = "http://localhost:8000/api/v1/autofix/generate/bulk"
-KEY = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+KEY = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 
 findings = [
     {"id": "trivy-CVE-2023-46233", "title": "CVE-2023-46233: crypto-js PBKDF2 weakness",

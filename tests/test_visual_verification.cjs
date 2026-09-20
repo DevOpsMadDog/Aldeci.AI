@@ -41,7 +41,7 @@ const ROUTES_FILE = process.env.ROUTES_FILE || "/tmp/routes.txt";
 const BASE_URL = process.env.BASE_URL || "http://localhost:5173";
 const API_BASE = process.env.API_BASE || "http://localhost:8000";
 const API_KEY = process.env.API_KEY ||
-  "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_";
+  "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN";
 const ORG_ID = process.env.ORG_ID || "juice-shop-corp";
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR ||
   "/Users/devops.ai/fixops/Fixops/docs/ui-snapshots/visual-verify-2026-04-24";

@@ -31,7 +31,7 @@ import urllib.error
 
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL   = "http://localhost:8000"
-API_TOKEN  = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_TOKEN  = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ORG_ID     = "aspm-test"
 REPOS_DIR  = Path("/tmp/aspm-repos")
 ARTIFACTS  = Path("/tmp/aspm-artifacts")

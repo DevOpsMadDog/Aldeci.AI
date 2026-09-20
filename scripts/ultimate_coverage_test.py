@@ -21,7 +21,7 @@ import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL   = "http://localhost:8000"
-TOKEN      = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+TOKEN      = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ORG_ID     = "coverage-test"
 TIMEOUT    = 8
 REQ_DELAY  = 0.52   # ~115 req/min (safely under 120 limit)

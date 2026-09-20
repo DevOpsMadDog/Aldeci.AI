@@ -11,7 +11,7 @@
 set -euo pipefail
 
 BASE_URL="${1:-http://localhost:8000}"
-API_KEY="${2:-fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_}"
+API_KEY="${2:-fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COLLECTION="$SCRIPT_DIR/postman/ALdeci-CTEM-25-Personas.postman_collection.json"
 REPORT_DIR="$SCRIPT_DIR/../newman-reports"

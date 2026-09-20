@@ -4,7 +4,7 @@ import json, urllib.request
 
 API = "http://localhost:8000/api/v1"
 import os
-TOKEN = os.environ.get("FIXOPS_API_TOKEN", "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_")
+TOKEN = os.environ.get("FIXOPS_API_TOKEN", "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN")
 HDR = {"Content-Type": "application/json", "X-API-Key": TOKEN}
 
 def post(path, body):

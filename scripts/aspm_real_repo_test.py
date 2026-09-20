@@ -47,7 +47,7 @@ import os
 API_BASE = os.getenv("ALDECI_URL", "http://localhost:8000")
 API_KEY  = os.getenv(
     "ALDECI_TOKEN",
-    "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_",
+    "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN",
 )
 HEADERS = {
     "X-API-Key": API_KEY,

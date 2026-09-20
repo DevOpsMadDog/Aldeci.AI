@@ -20,7 +20,7 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 BASE = "http://localhost:8000"
-TOKEN = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+TOKEN = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ORG = "intel-test"
 HEADERS = {"X-API-Key": TOKEN, "Content-Type": "application/json"}
 DELAY = 0.3  # 0.3s between calls (rate limiting disabled on server)

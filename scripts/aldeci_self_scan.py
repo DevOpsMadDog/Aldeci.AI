@@ -21,7 +21,7 @@ import urllib.request
 import urllib.error
 
 BASE_URL = "http://localhost:8000"
-API_KEY  = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_KEY  = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 DELAY    = 0.7
 
 BANDIT_JSON  = "/tmp/bandit_fixops.json"

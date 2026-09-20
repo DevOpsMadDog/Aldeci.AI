@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 const API_BASE = process.env.VITE_API_URL || "http://localhost:8000";
 const API_TOKEN =
   process.env.FIXOPS_API_TOKEN ||
-  "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_";
+  "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN";
 const ORG_ID = process.env.DEMO_ORG_ID || "juice-shop-corp";
 
 // Resolve repo root from this file (suite-ui/aldeci-ui-new/e2e/) → ../../../

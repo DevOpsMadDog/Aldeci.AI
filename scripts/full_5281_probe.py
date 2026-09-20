@@ -30,7 +30,7 @@ for d in [
 sys.setrecursionlimit(5000)
 
 os.environ.setdefault("FIXOPS_MODE", "enterprise")
-os.environ.setdefault("FIXOPS_API_TOKEN", "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_")
+os.environ.setdefault("FIXOPS_API_TOKEN", "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN")
 os.environ.setdefault("FIXOPS_JWT_SECRET", "probe-secret")
 os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/probe.db")
 
@@ -95,7 +95,7 @@ def build_url(base: str, method: str, path: str) -> tuple[str, dict | None, dict
 
 # ── 4. PROBE ────────────────────────────────────────────────────────────────────
 BASE_URL   = "http://localhost:8000"
-API_TOKEN  = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_TOKEN  = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 DELAY      = 0.05   # 50 ms between requests
 TIMEOUT    = 5      # seconds per request
 

@@ -6,7 +6,7 @@ router schemas.
 import time
 import requests
 
-TOKEN = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+TOKEN = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 BASE = "http://localhost:8000"
 ORG = "default"
 HDR = {"X-API-Key": TOKEN, "Content-Type": "application/json"}

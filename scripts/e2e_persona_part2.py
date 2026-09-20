@@ -4,7 +4,7 @@ import json
 import requests
 import time
 
-API_KEY = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_KEY = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 BASE = "http://localhost:8000"
 H = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 

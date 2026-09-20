@@ -100,7 +100,7 @@ def test_bug1_endpoint_does_not_500_authenticated(fresh_app_client, path):
     """Authenticated calls must return 200/501, never 500."""
     api_key = os.environ.get(
         "FIXOPS_API_KEY",
-        "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_",
+        "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN",
     )
     headers = {"X-API-Key": api_key}
     response = fresh_app_client.get(path, headers=headers)

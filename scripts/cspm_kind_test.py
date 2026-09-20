@@ -52,7 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_CLUSTER   = "aldeci-lab"
 DEFAULT_URL       = "http://localhost:8000"
 DEFAULT_ORG       = "cspm-test"
-API_TOKEN         = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_TOKEN         = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 
 KIND_CONFIG = """
 apiVersion: kind.x-k8s.io/v1alpha4

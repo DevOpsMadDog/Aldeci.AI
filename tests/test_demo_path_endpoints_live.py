@@ -34,7 +34,7 @@ def _load_api_key() -> str:
                     return line.split("=", 1)[1].strip()
     except OSError:
         pass
-    return "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+    return "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 
 API_KEY = _load_api_key()
 HEADERS = {"X-API-Key": API_KEY}

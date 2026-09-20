@@ -18,7 +18,7 @@ import urllib.error
 # ---------------------------------------------------------------------------
 
 BASE = "http://localhost:8000"
-API_KEY = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_KEY = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 ORG = "live-test"
 DELAY = 0.6  # 120 req/min rate limit → stay under with 0.6s = ~100 req/min
 

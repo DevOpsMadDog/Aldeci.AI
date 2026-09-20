@@ -50,7 +50,7 @@ import urllib.request
 BASE_URL: str = os.getenv("ALDECI_BASE_URL", "http://localhost:8000")
 API_KEY: str = os.getenv(
     "ALDECI_API_KEY",
-    "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_",
+    "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN",
 )
 ORG_ID: str = os.getenv("ALDECI_ORG_ID", "aldeci-self")
 DRY_RUN: bool = os.getenv("SELF_SCAN_DRY_RUN", "0") == "1"

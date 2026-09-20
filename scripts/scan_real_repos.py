@@ -32,7 +32,7 @@ import requests
 
 # ── Configuration ────────────────────────────────────────────────────────────
 API_BASE = "http://localhost:8000"
-API_KEY = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+API_KEY = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 HEADERS = {"X-API-Key": API_KEY}
 CALL_DELAY = 0.6        # seconds between API calls
 MAX_FINDINGS_PER_SCAN = 20

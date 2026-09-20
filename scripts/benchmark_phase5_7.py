@@ -9,7 +9,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 API_BASE = "http://localhost:8000/api/v1"
-KEY = "fixops_ent_38wJA8mb7CsbJ3PaLvKNz7lFnLWvFWXti_5NcdISXSogi_4grP24NAe_XymVfps_"
+KEY = "fixops_ent_REDACTED_SET_FIXOPS_API_TOKEN"
 HEADERS = {"X-API-Key": KEY, "Content-Type": "application/json"}
 
 # Juice Shop CycloneDX SBOM (key vulnerable + safe components)
