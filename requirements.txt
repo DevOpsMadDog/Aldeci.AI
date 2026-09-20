@@ -15,7 +15,7 @@ httpx2>=2.2.0,<3.0
 pgmpy==0.1.24
 PyJWT>=2.12.0,<3.0
 cryptography>=50.0.0,<51.0.0
-cffi>=2.0.0,<3.0
+cffi>=2.1.1,<3.0
 structlog>=25.4.0,<26.0.0
 PyYAML>=6.0.1,<7.0
 # NetworkX 3.5+ requires Python >=3.10; allow older Python runtimes to use 3.2.x
