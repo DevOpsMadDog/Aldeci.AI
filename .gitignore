@@ -277,3 +277,10 @@ build/sdk/
 
 # Understand-Anything intermediate output (regenerable)
 .ua/
+
+# Any runtime data directory, not just the default name.
+# FIXOPS_DATA_DIR is operator-chosen and scripts/demo.py uses .fixops_demo/, so
+# pinning only ".fixops_data/" let every other one through. Committed SQLite
+# databases are how the previous repository reached 938 MB of history for 14 MB
+# of code.
+.fixops_*/

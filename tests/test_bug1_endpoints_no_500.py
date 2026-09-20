@@ -40,13 +40,20 @@ BUG1_ENDPOINTS = [
 ]
 
 
+# NOTE: no @pytest.mark.timeout here. A mark on a FIXTURE has never done
+# anything — pytest ignored it, deprecated it, and 9.1 turned it into a hard
+# collection error ("Marks cannot be applied to fixtures"), which took this
+# whole file out of collection on any fresh install. requirements.txt puts no
+# ceiling on pytest, so CI resolves 9.1.x and sees the failure that a stale
+# local environment does not. The suite-wide --timeout already covers the
+# tests that use this fixture.
 @pytest.fixture(scope="module")
-@pytest.mark.timeout(120)
 def fresh_app_client():
     """Boot FastAPI app against a fresh, empty data directory.
 
-    App boot loads ~590 routers and is slow (~10s); allow up to 120s for the
-    fixture so the regression test isn't killed by the default 10s timeout.
+    App boot loads ~590 routers and is slow (~10s). The 120s allowance lives
+    on the TESTS below, not here: a mark on a fixture is silently ignored by
+    pytest and a hard collection error from 9.1 onwards.
     """
     # Auto-load .env so FIXOPS_API_KEY is available
     try:
@@ -73,6 +80,7 @@ def fresh_app_client():
 
 
 @pytest.mark.parametrize("path", BUG1_ENDPOINTS)
+@pytest.mark.timeout(120)  # booting ~590 routers exceeds the 10s default
 def test_bug1_endpoint_does_not_500_unauthenticated(fresh_app_client, path):
     """Unauthenticated calls must return 401/403, never 500."""
     response = fresh_app_client.get(path)
@@ -87,6 +95,7 @@ def test_bug1_endpoint_does_not_500_unauthenticated(fresh_app_client, path):
 
 
 @pytest.mark.parametrize("path", BUG1_ENDPOINTS)
+@pytest.mark.timeout(120)  # booting ~590 routers exceeds the 10s default
 def test_bug1_endpoint_does_not_500_authenticated(fresh_app_client, path):
     """Authenticated calls must return 200/501, never 500."""
     api_key = os.environ.get(

@@ -22,6 +22,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git && rm -rf /var/lib/apt/lists/*
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+# Upgrade the build tooling before installing anything.
+#
+# The venv inherits whatever setuptools the base image ships, and that is how
+# PYSEC-2026-3447 (setuptools < 83.0.0) reaches the image — pip-audit flags it
+# in a freshly built container even though setuptools appears nowhere in
+# requirements.txt. It is a build-time dependency, so it has to be fixed here
+# rather than in the requirements file.
+RUN pip install --no-cache-dir --upgrade "pip" "setuptools>=83.0.0" "wheel"
 # CPU-only PyTorch (much smaller than GPU)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 COPY requirements.txt .
