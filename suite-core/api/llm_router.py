@@ -473,6 +473,36 @@ async def llm_health() -> Dict[str, Any]:
         }
     )
 
+    # The COUNCIL — the actual multi-model consensus path, and the one this
+    # endpoint did not know existed.
+    #
+    # core.llm_council_real.LLMCouncil talks to five models through OpenRouter,
+    # not through a direct openai/anthropic/google key. So with a working,
+    # keyed council this endpoint still answered "degraded" and listed every
+    # provider as unavailable — understating a capability that was live.
+    #
+    # Measured: a real convene returned five distinct verdicts with distinct
+    # reasoning (and one dissent) while this endpoint reported the LLM
+    # integration as not configured. Understating is safer than overstating,
+    # but it is still wrong, and it contradicted the demo's own council step.
+    council_key = (
+        os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("FIXOPS_OPENROUTER_KEY")
+        or os.getenv("MULEROUTER_API_KEY")
+    )
+    providers_status.append(
+        {
+            "provider": "council",
+            "available": bool(council_key),
+            "detail": (
+                "multi-model consensus via OpenRouter"
+                if council_key
+                else "set OPENROUTER_API_KEY — the council refuses to convene "
+                     "without it rather than returning a fabricated verdict"
+            ),
+        }
+    )
+
     any_available = any(p["available"] for p in providers_status)
 
     return {

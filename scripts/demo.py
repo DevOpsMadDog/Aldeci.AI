@@ -15,9 +15,15 @@ simulations/demo_pack/scanner.sarif, which is real scanner output that is
 already here.
 
 What it deliberately does NOT do is fake anything. Capabilities that need a
-credential (the LLM council needs an OpenRouter key; EPSS/KEV need a feed
-refresh) are reported as unconfigured, with the variable to set. A demo that
-shows invented numbers is worse than one that shows honest gaps.
+credential are reported as unconfigured, with the variable to set — a demo
+that shows invented numbers is worse than one that shows honest gaps.
+
+The council step proves this in both directions. With no OPENROUTER_API_KEY it
+asserts that the council REFUSES to convene (construction raises; there is no
+silent fallback that would invent a verdict). With a key set it convenes for
+real and asserts that every member returned a DISTINCT reasoning — one
+templated answer repeated across five names would be a fallback wearing a
+council's clothes, and the check fails the run.
 """
 
 from __future__ import annotations
@@ -176,9 +182,11 @@ def main() -> int:
 
     print("\n7. What needs configuration (reported, not faked)")
     for label, path, how in (
-        ("LLM council", "/api/v1/llm/health",       "set OPENROUTER_API_KEY"),
-        ("CISA KEV",    "/api/v1/feeds/kev/status", "run a feed refresh"),
-        ("EPSS",        "/api/v1/epss/scores",      "run a feed refresh"),
+        # The council is NOT listed here — step 8 exercises it directly.
+        # Reporting it in both places printed "not configured" beside a run in
+        # which five models had just voted.
+        ("CISA KEV", "/api/v1/feeds/kev/status", "run a feed refresh"),
+        ("EPSS",     "/api/v1/epss/scores",      "run a feed refresh"),
     ):
         response = client.get(path, headers=headers)
         text = response.text.lower()
@@ -190,6 +198,50 @@ def main() -> int:
                   f"Reported as absent rather than filled with a plausible number.")
         else:
             _ok(f"{label}: live")
+
+    print("\n8. The multi-LLM council")
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        # Refusing is the correct behaviour, so demonstrate THAT rather than
+        # skipping the step. LLMCouncil raises on construction without a key —
+        # it has no silent fallback that would invent a verdict.
+        try:
+            from core.llm_council_real import CouncilNotConfiguredError, LLMCouncil
+
+            LLMCouncil(openrouter_key="")
+            _fail("the council constructed without a key — it must refuse")
+            return 1
+        except CouncilNotConfiguredError:
+            _info("no OPENROUTER_API_KEY — the council REFUSES to convene rather "
+                  "than returning a fabricated verdict. Set the key and re-run "
+                  "to see five models actually vote.")
+        except ImportError:
+            _info("council module unavailable in this build")
+    else:
+        import asyncio
+
+        from core.llm_council_real import LLMCouncil
+
+        council = LLMCouncil()
+        verdict = asyncio.run(council.convene(
+            "Should this finding block the release?",
+            {"finding": items[0].get("title"),
+             "severity": items[0].get("severity"),
+             "asset": "demo-app"},
+        ))
+        votes = verdict["individual_votes"]
+        reasons = {str(v.get("reasoning", "")) for v in votes}
+        _ok(f"{len(votes)} models voted → {verdict['verdict']} "
+            f"{verdict['vote_counts']} in {verdict['latency_ms']}ms")
+        for vote in votes:
+            print(f"      {vote['model'][:34]:36s} {vote['vote']:9s} "
+                  f"conf={vote.get('confidence')} {vote.get('latency_ms')}ms")
+        # The proof that these are real independent calls rather than one
+        # templated answer repeated: distinct reasoning from every member.
+        if len(reasons) != len(votes):
+            _fail(f"only {len(reasons)} distinct reasonings across {len(votes)} "
+                  f"members — that is a fallback, not a council")
+            return 1
+        _ok(f"{len(reasons)} of {len(votes)} distinct reasonings — independent calls")
 
     print(f"\n{GREEN}Demo path verified{RESET} in {time.time() - t0:.0f}s — "
           f"ingest → org-scoped findings → isolation, with no fabricated data.\n")
